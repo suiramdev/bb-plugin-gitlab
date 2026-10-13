@@ -2637,7 +2637,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "gitlab",
     title: "GitLab",
-    icon: "GitMerge",
+    icon: "gitlab",
     path: PANEL_PATH,
     component: GitlabPanel,
     headerContent: PanelHeader,
