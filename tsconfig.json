@@ -15,7 +15,7 @@
   },
   "include": [
     "server.ts",
-    "server.test.ts",
+    "server",
     "app.tsx",
     "components",
     "lib",

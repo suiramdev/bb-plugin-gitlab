@@ -36,7 +36,7 @@ import {
   type PluginThreadPanelProps,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
-import type { gitlabRpcContract } from "./server";
+import type { gitlabRpcContract } from "./server/contract";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
