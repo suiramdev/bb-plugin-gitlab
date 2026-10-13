@@ -7,7 +7,10 @@ import {
   countDiffLines,
   fetchProjectItems,
   gitlabRpcContract,
+  graphqlData,
+  graphqlReadCommands,
   isProjectRef,
+  mutationPayload,
   normalizeHostname,
   normalizeProjectRef,
   parseAuthenticatedHosts,
@@ -15,6 +18,7 @@ import {
   parseProjectRef,
   toItems,
   validateGitlabCliArgs,
+  webUrlFor,
   type GitlabHost,
 } from "./server";
 
@@ -204,25 +208,85 @@ describe("glab plumbing", () => {
   });
 });
 
+describe("GitLab GraphQL responses", () => {
+  it("unwraps data and turns GraphQL errors into one rejection", () => {
+    expect(graphqlData({ data: { currentUser: { username: "tanuki" } } })).toEqual({
+      currentUser: { username: "tanuki" },
+    });
+    expect(() =>
+      graphqlData({
+        errors: [
+          { message: "Field 'nope' doesn't exist on type 'Project'" },
+          { message: "second" },
+        ],
+      }),
+    ).toThrow("Field 'nope' doesn't exist on type 'Project'; second");
+    expect(() => graphqlData("<html>")).toThrow("malformed");
+  });
+
+  it("rejects a mutation GitLab refused in its payload", () => {
+    expect(
+      mutationPayload({ createNote: { errors: [] } }, "createNote"),
+    ).toEqual({ errors: [] });
+    expect(() =>
+      mutationPayload(
+        { updateIssue: { errors: ["You do not have permission"], issue: null } },
+        "updateIssue",
+      ),
+    ).toThrow("You do not have permission");
+    expect(() => mutationPayload({ createIssue: null }, "createIssue")).toThrow(
+      "returned no result",
+    );
+  });
+
+  it("hands agents GraphQL read commands, never REST subcommands", () => {
+    const [issue] = graphqlReadCommands("issue", "gitlab.example.dev/group/sub/app", 7);
+    expect(issue).toBe(
+      "glab api graphql --hostname gitlab.example.dev -f path=group/sub/app -f iid=7 " +
+        "-f query='query($path: ID!, $iid: String!) { project(fullPath: $path) { " +
+        "issue(iid: $iid) { title state webUrl description notes(first: 100) " +
+        "{ nodes { system body createdAt author { username } } } } } }'",
+    );
+    const mr = graphqlReadCommands("mr", "gitlab.com/group/app", 12);
+    expect(mr).toHaveLength(2);
+    expect(mr[1]).toContain("mergeRequest(iid: $iid) { diffs(first: 100)");
+    for (const command of mr) expect(command).toMatch(/^glab api graphql /);
+  });
+
+  it("resolves web paths against the instance, keeping its subfolder", () => {
+    expect(
+      webUrlFor(
+        "/gitlab/group/app/-/jobs/9",
+        "https://code.example.dev/gitlab/group/app/-/merge_requests/3",
+      ),
+    ).toBe("https://code.example.dev/gitlab/group/app/-/jobs/9");
+    expect(webUrlFor("", "https://gitlab.com/g/a/-/merge_requests/1")).toBe("");
+    expect(webUrlFor("/g/a/-/jobs/1", "")).toBe("");
+  });
+});
+
 describe("GitLab payload parsing", () => {
-  it("normalizes issue and merge-request rows, dropping unusable ones", () => {
-    const rows = [
-      {
-        iid: 7,
-        title: "Fix the flaky spec",
-        state: "opened",
-        work_in_progress: true,
-        author: { id: 3, username: "tanuki" },
-        labels: ["bug", "ci"],
-        assignees: [{ id: 4, username: "mensahs" }, { id: 5, username: "" }],
-        web_url: "https://gitlab.com/group/app/-/merge_requests/7",
-        description: "It fails once per week.",
-        updated_at: "2026-08-14T12:29:03.902Z",
-      },
-      // No iid: GitLab cannot address it, so neither can the cache.
-      { title: "orphan" },
-    ];
-    expect(toItems(rows, "gitlab.com/group/app", "mr")).toEqual([
+  it("normalizes issue and merge-request nodes, dropping unusable ones", () => {
+    const connection = {
+      nodes: [
+        {
+          iid: "7",
+          title: "Fix the flaky spec",
+          state: "opened",
+          draft: true,
+          author: { username: "tanuki" },
+          labels: { nodes: [{ title: "bug" }, { title: "ci" }] },
+          assignees: { nodes: [{ username: "mensahs" }, { username: "" }] },
+          webUrl: "https://gitlab.com/group/app/-/merge_requests/7",
+          description: "It fails once per week.",
+          updatedAt: "2026-08-14T12:29:03Z",
+        },
+        // No iid: GitLab cannot address it, so neither can the cache.
+        { title: "orphan" },
+        null,
+      ],
+    };
+    expect(toItems(connection, "gitlab.com/group/app", "mr")).toEqual([
       {
         project: "gitlab.com/group/app",
         iid: 7,
@@ -235,47 +299,56 @@ describe("GitLab payload parsing", () => {
         assignees: ["mensahs"],
         url: "https://gitlab.com/group/app/-/merge_requests/7",
         body: "It fails once per week.",
-        updatedAt: "2026-08-14T12:29:03.902Z",
+        updatedAt: "2026-08-14T12:29:03Z",
       },
     ]);
   });
 
   it("falls back to empty fields rather than failing a whole list", () => {
-    const items = toItems([{ iid: 1, description: null, labels: null }], "gitlab.com/g/a", "issue");
+    const items = toItems(
+      { nodes: [{ iid: "1", description: null, labels: null }] },
+      "gitlab.com/g/a",
+      "issue",
+    );
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ title: "", state: "opened", body: "", labels: [], author: "" });
+    expect(toItems(null, "gitlab.com/g/a", "issue")).toEqual([]);
     expect(toItems({ message: "404 Not found" }, "gitlab.com/g/a", "issue")).toEqual([]);
   });
 
-  it("keeps merge requests when a project has issues disabled", async () => {
-    const endpoints: string[] = [];
-    const items = await fetchProjectItems(async (_project, endpoint) => {
-      endpoints.push(endpoint);
-      if (endpoint.includes("/issues?")) {
-        throw new Error("glab api failed: 404 Not found (HTTP 404)");
-      }
-      if (endpoint.includes("state=opened")) {
-        return [
-          {
-            iid: 12,
-            title: "Add geometries",
-            state: "opened",
-            author: { username: "mensahs" },
-            web_url: "https://gitlab.example.dev/group/sub/app/-/merge_requests/12",
-            updated_at: "2026-08-14T12:29:03.902Z",
+  it("syncs a project in one query and keeps merge requests when issues are disabled", async () => {
+    const calls: Array<{ host: string; query: string; variables: unknown }> = [];
+    const items = await fetchProjectItems(async (host, query, variables) => {
+      calls.push({ host, query, variables });
+      return {
+        project: {
+          // Issues disabled: GitLab returns no issue connection.
+          openIssues: null,
+          closedIssues: null,
+          openMergeRequests: {
+            nodes: [
+              {
+                iid: "12",
+                title: "Add geometries",
+                state: "opened",
+                draft: false,
+                author: { username: "mensahs" },
+                webUrl: "https://gitlab.example.dev/group/sub/app/-/merge_requests/12",
+                updatedAt: "2026-08-14T12:29:03Z",
+              },
+            ],
           },
-        ];
-      }
-      return [];
+          closedMergeRequests: { nodes: [] },
+          mergedMergeRequests: { nodes: [] },
+        },
+      };
     }, "gitlab.example.dev/group/sub/app");
 
-    // Subgroup paths must reach GitLab URL-encoded, as one id segment.
-    expect(
-      endpoints.every((endpoint) =>
-        endpoint.startsWith("projects/group%2Fsub%2Fapp/"),
-      ),
-    ).toBe(true);
-    expect(endpoints).toHaveLength(5);
+    // One request, on the project's host, with the full path as a variable.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].host).toBe("gitlab.example.dev");
+    expect(calls[0].variables).toEqual({ path: "group/sub/app" });
+    expect(calls[0].query).toContain("project(fullPath: $path)");
     expect(items).toEqual([
       {
         project: "gitlab.example.dev/group/sub/app",
@@ -289,15 +362,21 @@ describe("GitLab payload parsing", () => {
         assignees: [],
         url: "https://gitlab.example.dev/group/sub/app/-/merge_requests/12",
         body: "",
-        updatedAt: "2026-08-14T12:29:03.902Z",
+        updatedAt: "2026-08-14T12:29:03Z",
       },
     ]);
+  });
+
+  it("caches nothing for a project GitLab cannot find", async () => {
+    await expect(
+      fetchProjectItems(async () => ({ project: null }), "gitlab.com/gone/app"),
+    ).resolves.toEqual([]);
   });
 
   it("lets a genuine failure abort the sync instead of caching an empty project", async () => {
     await expect(
       fetchProjectItems(async () => {
-        throw new Error("glab api failed: 500 Internal Server Error");
+        throw new Error("glab api graphql failed: 500 Internal Server Error");
       }, "gitlab.com/group/app"),
     ).rejects.toThrow("500");
   });

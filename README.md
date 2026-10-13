@@ -48,7 +48,8 @@ thread links survive it.
   agent context at send time.
 - **`bb gitlab` CLI**: `projects`, `issues [project]`, `mrs [project]`, `sync` —
   also discoverable by agents through the plugin-commands skill, alongside the
-  bundled `gitlab` skill that teaches `glab` conventions.
+  bundled `gitlab` skill that teaches `glab` conventions, with GraphQL
+  (`glab api graphql`) for what the subcommands do not cover.
 
 ## Auth and any GitLab domain
 
@@ -106,7 +107,8 @@ A background service refreshes the issue/MR cache every 5 minutes; the panel's
 Refresh button (or `bb gitlab sync`) forces it. The cache holds open items plus
 a page of recently closed and merged ones, and the panel filters that cache in
 the browser, so `is:closed` or `is:merged` costs nothing. Detail views,
-mutations, and mention resolution always go live through `glab api`.
+mutations, and mention resolution always go live. Every request the plugin
+sends to GitLab is a GraphQL request through `glab api graphql`.
 
 ## Development
 

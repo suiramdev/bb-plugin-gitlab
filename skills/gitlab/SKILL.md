@@ -1,15 +1,18 @@
 ---
 name: gitlab
-description: Read and act on GitLab issues, merge requests, pipelines, and notes with the glab CLI and the `bb gitlab` command. Use when a task references a GitLab issue (#123), a merge request (!456), a GitLab project path, a pipeline failure, or when opening/updating a merge request.
+description: Read and act on GitLab issues, merge requests, pipelines, and notes with the glab CLI (GraphQL through `glab api graphql` as the fallback) and the `bb gitlab` command. Use when a task references a GitLab issue (#123), a merge request (!456), a GitLab project path, a pipeline failure, or when opening/updating a merge request.
 ---
 
 # Working with GitLab
 
-Two tools, different jobs:
+Three tools, in this order:
 
 - `bb gitlab …` — the plugin's cached view across every tracked project. Fast,
   no network, no host flags. Use it to find things.
-- `glab …` — the GitLab CLI, live. Use it to read details and to write.
+- `glab …` subcommands (`glab issue`, `glab mr`, `glab ci`) — the GitLab CLI,
+  live. Use them to read details and to write whenever one covers the task.
+- `glab api graphql …` — the GitLab GraphQL API. Use it only for what the
+  subcommands do not cover. Do not call REST endpoints with `glab api <path>`.
 
 ## Find work
 
@@ -36,14 +39,25 @@ glab ci status -R <project>              # pipeline for the current branch
 
 `-R` accepts the same host-qualified ref `bb gitlab` prints.
 
-For anything the subcommands do not cover, call the REST API directly. The
-project path is one URL-encoded id segment, and `--hostname` takes the bare
-hostname only — never a scheme, a port, or a path:
+For anything the subcommands do not cover, such as inline review threads or
+the jobs of a merge request's pipeline, use GraphQL. Split the project ref at
+the first `/`: the first part is `--hostname`, the rest is the project's
+`fullPath`. Pass the path as written (no URL encoding). `iid` is a string.
+`--hostname` takes the bare hostname only — never a scheme, a port, or a path.
 
 ```sh
-glab api --hostname <host> "projects/group%2Fsubgroup%2Fapp/merge_requests/12/discussions"
-glab api --hostname <host> "projects/group%2Fsubgroup%2Fapp/pipelines/26774/jobs"
+glab api graphql --hostname <host> -f path=group/subgroup/app -f iid=12 -f query='
+  query($path: ID!, $iid: String!) {
+    project(fullPath: $path) {
+      mergeRequest(iid: $iid) {
+        discussions { nodes { resolved notes { nodes { body author { username } position { newPath newLine } } } } }
+        headPipeline { status jobs { nodes { name status webPath } } }
+      }
+    }
+  }'
 ```
+
+Notes include GitLab's activity feed; skip notes with `system: true`.
 
 Self-managed instances need nothing extra here. How a host is really reached —
 `https` or `http`, a non-default port (`api_host`), a subfolder install
@@ -54,7 +68,7 @@ hardcode a URL:
 ```sh
 glab config get subfolder --host <host>   # e.g. "gitlab" for https://example.com/gitlab/
 glab config get api_host --host <host>    # e.g. "example.com:8443"
-glab auth status --hostname <host>        # prints the resolved REST endpoint
+glab auth status --hostname <host>        # prints the resolved GraphQL endpoint
 ```
 
 ## Write
@@ -68,14 +82,15 @@ glab issue note <iid> -R <project> -m "message"
 glab issue close <iid> -R <project>
 ```
 
-Through the API, text belongs in `--raw-field` (commas and quotes survive) and
-array parameters belong in the query string, which GitLab reads for `PUT` too:
+When no subcommand covers the change, use a GraphQL mutation. Pass text with
+`-f` (sent verbatim) and input objects with `-F` as JSON. GitLab reports a
+refused mutation in the payload's `errors`, so always select `errors` and check
+that it is empty:
 
 ```sh
-glab api --hostname <host> --method POST --raw-field "body=Looks good" \
-  "projects/group%2Fapp/merge_requests/12/notes"
-glab api --hostname <host> --method PUT \
-  "projects/group%2Fapp/issues/7?assignee_ids[]=24"
+glab api graphql --hostname <host> \
+  -F 'input={"projectPath":"group/app","iid":"7","assigneeUsernames":["tanuki"],"operationMode":"REPLACE"}' \
+  -f query='mutation($input: IssueSetAssigneesInput!) { issueSetAssignees(input: $input) { errors } }'
 ```
 
 ## GitLab vocabulary that changes behavior
@@ -85,11 +100,13 @@ glab api --hostname <host> --method PUT \
 - States are `opened`, `closed`, `merged`, `locked`; draft is a separate flag,
   set by a `Draft:` title prefix.
 - `iid` is the per-project number a human quotes; `id` is the instance-wide id
-  the API also accepts. Always pass `iid` to the endpoints above.
-- Mergeability lives in `detailed_merge_status` (`mergeable`, `need_rebase`,
-  `ci_must_pass`, …), not in a boolean.
+  the API also accepts (in GraphQL, a global id such as
+  `gid://gitlab/Issue/42`). Always pass `iid`: to the subcommands, and to
+  `issue(iid:)` and `mergeRequest(iid:)` in GraphQL.
+- Mergeability lives in `detailedMergeStatus` (`MERGEABLE`, `NEED_REBASE`,
+  `CI_MUST_PASS`, …), not in a boolean.
 - CI is a pipeline of jobs. A `manual` or `skipped` job is not a failure.
-- Approvals replace reviews: `approvals_left` is the gate to watch.
+- Approvals replace reviews: `approvalsLeft` is the gate to watch.
 
 ## Do not
 

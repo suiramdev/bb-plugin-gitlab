@@ -7,8 +7,8 @@
 // optional extraProjects setting. A background service syncs open +
 // recently-closed issues/MRs into the plugin's SQLite cache; the frontend
 // panel and mention providers read that cache, while mutations (note, create,
-// close/reopen, assign, label) and detail views go straight through
-// `glab api`.
+// close/reopen, assign, label) and detail views go straight to GitLab. Every
+// GitLab request is GraphQL, sent through `glab api graphql`.
 //
 // A project is addressed by its host-qualified ref — "gitlab.com/group/sub/app"
 // — because a GitLab path has any number of namespace segments and the same
@@ -110,7 +110,7 @@ const mergeRequestSchema = z
     updatedAt: z.string(),
     sourceBranch: z.string(),
     targetBranch: z.string(),
-    /** Summed over the diffs actually fetched — see filesTruncated. */
+    /** GitLab's totals for the whole merge request, even when files is partial. */
     additions: z.number().int().nonnegative(),
     deletions: z.number().int().nonnegative(),
     /** GitLab's own total, which can exceed files.length. */
@@ -120,7 +120,7 @@ const mergeRequestSchema = z
     labels: z.array(z.string()),
     assignees: z.array(z.string()),
     reviewers: z.array(z.string()),
-    /** GitLab's detailed_merge_status, e.g. "mergeable", "need_rebase". */
+    /** GitLab's detailedMergeStatus lowercased, e.g. "mergeable", "need_rebase". */
     mergeStatus: z.string(),
     hasConflicts: z.boolean(),
     approvalsRequired: z.number().int().nonnegative(),
@@ -286,105 +286,235 @@ export const gitlabRpcContract = defineRpcContract({
 });
 
 // ---------------------------------------------------------------------------
-// GitLab REST payloads. These come off the network, so every field is parsed
-// with a fallback: one odd row must never take down a list or a detail view.
+// GitLab GraphQL payloads. These come off the network, so every field is
+// parsed with a fallback: one odd node must never take down a list or a
+// detail view.
 // ---------------------------------------------------------------------------
-const gitlabUserRowSchema = z.looseObject({
-  id: z.number().int().catch(0),
+
+/** A GraphQL connection's nodes, with unreadable nodes kept as null. */
+function connectionOf<T extends z.ZodType>(node: T) {
+  return z
+    .looseObject({ nodes: z.array(node.nullable().catch(null)).catch([]) })
+    .nullish()
+    .catch(null);
+}
+
+/** The readable nodes of a connection parsed by connectionOf. */
+function nodesOf<T>(connection: { nodes: Array<T | null> } | null | undefined): T[] {
+  return (connection?.nodes ?? []).filter((node): node is T => node !== null);
+}
+
+/** GraphQL sends some booleans (the Diff flags) as "true"/"false" strings. */
+const looseBooleanSchema = z
+  .union([z.boolean(), z.enum(["true", "false"]).transform((v) => v === "true")])
+  .catch(false);
+
+const gitlabUserNodeSchema = z.looseObject({
   username: z.string().catch(""),
 });
-const gitlabItemRowSchema = z.looseObject({
-  iid: z.number().int().positive(),
+const gitlabLabelNodeSchema = z.looseObject({
+  id: z.string().catch(""),
+  title: z.string().catch(""),
+});
+const gitlabItemNodeSchema = z.looseObject({
+  // GraphQL types iid as a string.
+  iid: z.coerce.number().int().positive(),
   title: z.string().catch(""),
   state: z.string().catch("opened"),
   draft: z.boolean().catch(false),
-  work_in_progress: z.boolean().catch(false),
-  author: gitlabUserRowSchema.nullish().catch(null),
-  labels: z.array(z.string()).catch([]),
-  assignees: z.array(gitlabUserRowSchema).catch([]),
-  web_url: z.string().catch(""),
+  author: gitlabUserNodeSchema.nullish().catch(null),
+  labels: connectionOf(gitlabLabelNodeSchema),
+  assignees: connectionOf(gitlabUserNodeSchema),
+  webUrl: z.string().catch(""),
   description: z.string().catch(""),
-  updated_at: z.string().catch(""),
+  updatedAt: z.string().catch(""),
 });
-const gitlabItemListSchema = z
-  .array(gitlabItemRowSchema.nullable().catch(null))
-  .catch([]);
-const gitlabMergeRequestRowSchema = gitlabItemRowSchema.extend({
-  created_at: z.string().catch(""),
-  source_branch: z.string().catch(""),
-  target_branch: z.string().catch(""),
-  changes_count: z.union([z.string(), z.number()]).catch(""),
-  has_conflicts: z.boolean().catch(false),
-  detailed_merge_status: z.string().catch(""),
-  merge_status: z.string().catch(""),
-  reviewers: z.array(gitlabUserRowSchema).catch([]),
-  head_pipeline: z
-    .looseObject({
-      id: z.number().int().nullable().catch(null),
-      status: z.string().catch(""),
-      web_url: z.string().catch(""),
-    })
-    .nullish()
-    .catch(null),
-});
-const gitlabNoteRowSchema = z.looseObject({
+const gitlabNoteNodeSchema = z.looseObject({
   body: z.string().catch(""),
   system: z.boolean().catch(false),
-  created_at: z.string().catch(""),
-  resolvable: z.boolean().catch(false),
-  resolved: z.boolean().catch(false),
-  author: gitlabUserRowSchema.nullish().catch(null),
+  createdAt: z.string().catch(""),
+  author: gitlabUserNodeSchema.nullish().catch(null),
   position: z
     .looseObject({
-      new_path: z.string().nullable().catch(null),
-      old_path: z.string().nullable().catch(null),
-      new_line: z.number().int().nullable().catch(null),
-      old_line: z.number().int().nullable().catch(null),
+      newPath: z.string().nullable().catch(null),
+      oldPath: z.string().nullable().catch(null),
+      newLine: z.number().int().nullable().catch(null),
+      oldLine: z.number().int().nullable().catch(null),
     })
     .nullish()
     .catch(null),
 });
-const gitlabNoteListSchema = z.array(gitlabNoteRowSchema).catch([]);
-const gitlabDiscussionListSchema = z
-  .array(z.looseObject({ notes: gitlabNoteListSchema }))
-  .catch([]);
-const gitlabDiffListSchema = z
-  .array(
-    z.looseObject({
-      old_path: z.string().catch(""),
-      new_path: z.string().catch(""),
-      new_file: z.boolean().catch(false),
-      deleted_file: z.boolean().catch(false),
-      renamed_file: z.boolean().catch(false),
-      diff: z.string().catch(""),
-    }),
-  )
-  .catch([]);
-const gitlabJobListSchema = z
-  .array(
-    z.looseObject({
-      name: z.string().catch("job"),
+const gitlabIssueDetailSchema = gitlabItemNodeSchema.extend({
+  notes: connectionOf(gitlabNoteNodeSchema),
+});
+const gitlabMergeRequestDetailSchema = gitlabItemNodeSchema.extend({
+  createdAt: z.string().catch(""),
+  sourceBranch: z.string().catch(""),
+  targetBranch: z.string().catch(""),
+  conflicts: z.boolean().catch(false),
+  detailedMergeStatus: z.string().nullable().catch(null),
+  reviewers: connectionOf(gitlabUserNodeSchema),
+  diffStatsSummary: z
+    .looseObject({
+      additions: z.number().int().nonnegative().catch(0),
+      deletions: z.number().int().nonnegative().catch(0),
+      fileCount: z.number().int().nonnegative().catch(0),
+    })
+    .nullish()
+    .catch(null),
+  diffStats: z
+    .array(
+      z.looseObject({
+        path: z.string().catch(""),
+        additions: z.number().int().nonnegative().catch(0),
+        deletions: z.number().int().nonnegative().catch(0),
+      }),
+    )
+    .catch([]),
+  headPipeline: z
+    .looseObject({
       status: z.string().catch(""),
-      web_url: z.string().catch(""),
-    }),
-  )
-  .catch([]);
-const gitlabApprovalsSchema = z
+      path: z.string().catch(""),
+    })
+    .nullish()
+    .catch(null),
+  notes: connectionOf(gitlabNoteNodeSchema),
+});
+const gitlabDiscussionsSchema = connectionOf(
+  z.looseObject({
+    resolvable: z.boolean().catch(false),
+    resolved: z.boolean().catch(false),
+    notes: connectionOf(gitlabNoteNodeSchema),
+  }),
+);
+const gitlabDiffsSchema = z
   .looseObject({
-    approvals_required: z.number().int().nonnegative().catch(0),
-    approvals_left: z.number().int().nonnegative().catch(0),
-    approved_by: z
-      .array(z.looseObject({ user: gitlabUserRowSchema.nullish().catch(null) }))
+    pageInfo: z
+      .looseObject({ hasNextPage: z.boolean().catch(false) })
+      .catch({ hasNextPage: false }),
+    nodes: z
+      .array(
+        z.looseObject({
+          oldPath: z.string().nullable().catch(null),
+          newPath: z.string().nullable().catch(null),
+          newFile: looseBooleanSchema,
+          deletedFile: looseBooleanSchema,
+          renamedFile: looseBooleanSchema,
+          diff: z.string().catch(""),
+        }),
+      )
       .catch([]),
   })
-  .catch({ approvals_required: 0, approvals_left: 0, approved_by: [] });
-const gitlabMemberListSchema = z.array(gitlabUserRowSchema).catch([]);
-const gitlabLabelListSchema = z
-  .array(z.looseObject({ name: z.string().catch("") }))
-  .catch([]);
+  .nullish()
+  .catch(null);
+const gitlabJobsSchema = connectionOf(
+  z.looseObject({
+    name: z.string().catch("job"),
+    status: z.string().catch(""),
+    webPath: z.string().catch(""),
+  }),
+);
+const gitlabApprovalsSchema = z
+  .looseObject({
+    approvalsRequired: z.number().int().nonnegative().catch(0),
+    approvalsLeft: z.number().int().nonnegative().catch(0),
+    approvedBy: connectionOf(gitlabUserNodeSchema),
+  })
+  .catch({ approvalsRequired: 0, approvalsLeft: 0, approvedBy: null });
+const gitlabMutationErrorsSchema = z
+  .looseObject({ errors: z.array(z.string()).catch([]) })
+  .nullish()
+  .catch(null);
+const graphqlResponseSchema = z.looseObject({
+  data: z.unknown().optional(),
+  errors: z
+    .array(z.looseObject({ message: z.string().catch("unknown error") }))
+    .optional()
+    .catch(undefined),
+});
 
-type GitlabUserRow = z.infer<typeof gitlabUserRowSchema>;
-type GitlabItemRow = z.infer<typeof gitlabItemRowSchema>;
+/** A `{ project(fullPath:) { … } }` result; a missing project parses as null. */
+function projectResultOf<T extends z.ZodType>(project: T) {
+  return z
+    .looseObject({ project: project.nullish().catch(null) })
+    .catch({ project: null });
+}
+
+/** A `project { item: issue|mergeRequest(iid:) { … } }` result. */
+function itemResultOf<T extends z.ZodType>(item: T) {
+  return projectResultOf(z.looseObject({ item: item.nullish().catch(null) }));
+}
+
+const issueDetailResultSchema = itemResultOf(gitlabIssueDetailSchema);
+const mergeRequestDetailResultSchema = itemResultOf(
+  gitlabMergeRequestDetailSchema,
+);
+const itemDetailResultSchema = itemResultOf(gitlabItemNodeSchema);
+const mergeRequestDiscussionsSchema = z
+  .looseObject({ discussions: gitlabDiscussionsSchema })
+  .catch({ discussions: null });
+const mergeRequestDiffsSchema = z
+  .looseObject({ diffs: gitlabDiffsSchema })
+  .catch({ diffs: null });
+const mergeRequestJobsSchema = z
+  .looseObject({
+    headPipeline: z
+      .looseObject({ jobs: gitlabJobsSchema })
+      .nullish()
+      .catch(null),
+  })
+  .catch({ headPipeline: null });
+const updatedIssueSchema = z
+  .looseObject({
+    issue: z
+      .looseObject({
+        state: z.string().optional().catch(undefined),
+        labels: connectionOf(gitlabLabelNodeSchema),
+        assignees: connectionOf(gitlabUserNodeSchema),
+      })
+      .nullish()
+      .catch(null),
+  })
+  .catch({ issue: null });
+const createdIssueSchema = z
+  .looseObject({
+    issue: z
+      .looseObject({
+        iid: z.coerce.number().int().positive().nullable().catch(null),
+        webUrl: z.string().catch(""),
+      })
+      .nullish()
+      .catch(null),
+  })
+  .catch({ issue: null });
+
+/** The `project.item` object of an itemQuery result, unparsed. */
+function itemOf(data: unknown): unknown {
+  return z
+    .looseObject({
+      project: z.looseObject({ item: z.unknown() }).nullish().catch(null),
+    })
+    .catch({ project: null })
+    .parse(data).project?.item;
+}
+
+/**
+ * An absolute URL for a GraphQL `webPath`/`path`. Those paths already carry
+ * any subfolder the instance is served under, so only the origin of a known
+ * web URL is needed.
+ */
+export function webUrlFor(path: string, knownWebUrl: string): string {
+  if (path.length === 0) return "";
+  try {
+    return new URL(path, knownWebUrl).toString();
+  } catch {
+    return "";
+  }
+}
+
+type GitlabUserNode = z.infer<typeof gitlabUserNodeSchema>;
+type GitlabItemNode = z.infer<typeof gitlabItemNodeSchema>;
+type GitlabNoteNode = z.infer<typeof gitlabNoteNodeSchema>;
 
 interface ProjectInfo {
   /** "host/group/sub/project" */
@@ -424,12 +554,219 @@ interface ThreadLink {
   createdAt: string;
 }
 
-/** Runs `glab api` against the host a project ref names, returning raw JSON. */
-type GitlabApi = (
-  project: string,
-  endpoint: string,
-  options?: { method?: "POST" | "PUT"; fields?: Record<string, string> },
+/**
+ * Runs one GraphQL request through `glab api graphql` on a glab host and
+ * resolves to the response's `data`. GraphQL errors reject.
+ */
+type GitlabGraphql = (
+  host: string,
+  query: string,
+  variables?: Record<string, unknown>,
 ) => Promise<unknown>;
+
+// ---------------------------------------------------------------------------
+// GraphQL documents. Issue and MergeRequest share these field names, so one
+// selection serves both; MergeRequest adds `draft`.
+// ---------------------------------------------------------------------------
+const ISSUE_FIELDS = `
+  iid title state webUrl description updatedAt
+  author { username }
+  labels { nodes { title } }
+  assignees { nodes { username } }`;
+const MERGE_REQUEST_FIELDS = `${ISSUE_FIELDS} draft`;
+const NOTE_FIELDS = "body system createdAt author { username }";
+
+const SYNC_QUERY = `
+  query GitlabSync($path: ID!) {
+    project(fullPath: $path) {
+      openIssues: issues(state: opened, sort: UPDATED_DESC, first: ${ISSUE_PAGE}) {
+        nodes { ${ISSUE_FIELDS} }
+      }
+      closedIssues: issues(state: closed, sort: UPDATED_DESC, first: ${CLOSED_ISSUE_PAGE}) {
+        nodes { ${ISSUE_FIELDS} }
+      }
+      openMergeRequests: mergeRequests(state: opened, sort: UPDATED_DESC, first: ${MR_PAGE}) {
+        nodes { ${MERGE_REQUEST_FIELDS} }
+      }
+      closedMergeRequests: mergeRequests(state: closed, sort: UPDATED_DESC, first: ${CLOSED_MR_PAGE}) {
+        nodes { ${MERGE_REQUEST_FIELDS} }
+      }
+      mergedMergeRequests: mergeRequests(state: merged, sort: UPDATED_DESC, first: ${CLOSED_MR_PAGE}) {
+        nodes { ${MERGE_REQUEST_FIELDS} }
+      }
+    }
+  }`;
+
+const VIEWER_QUERY = "query GitlabViewer { currentUser { username } }";
+
+const MEMBERS_QUERY = `
+  query GitlabMembers($path: ID!) {
+    project(fullPath: $path) {
+      projectMembers(first: 100) { nodes { user { username } } }
+    }
+  }`;
+
+const LABELS_QUERY = `
+  query GitlabLabels($path: ID!, $after: String) {
+    project(fullPath: $path) {
+      labels(first: 100, after: $after, includeAncestorGroups: true) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id title }
+      }
+    }
+  }`;
+
+/** One issue or merge request, by iid, with the given selection. */
+function itemQuery(kind: "issue" | "mr", selection: string): string {
+  const field = kind === "mr" ? "mergeRequest" : "issue";
+  return `
+    query GitlabItem($path: ID!, $iid: String!) {
+      project(fullPath: $path) {
+        item: ${field}(iid: $iid) { ${selection} }
+      }
+    }`;
+}
+
+const ISSUE_QUERY = itemQuery("issue", ISSUE_FIELDS);
+const MERGE_REQUEST_QUERY = itemQuery("mr", MERGE_REQUEST_FIELDS);
+
+const ISSUE_DETAIL_QUERY = itemQuery(
+  "issue",
+  `${ISSUE_FIELDS} notes(first: 100) { nodes { ${NOTE_FIELDS} } }`,
+);
+
+const MERGE_REQUEST_DETAIL_QUERY = itemQuery(
+  "mr",
+  `${MERGE_REQUEST_FIELDS}
+   createdAt sourceBranch targetBranch conflicts detailedMergeStatus
+   reviewers { nodes { username } }
+   diffStatsSummary { additions deletions fileCount }
+   diffStats { path additions deletions }
+   headPipeline { status path }
+   notes(first: 100) { nodes { ${NOTE_FIELDS} } }`,
+);
+
+/**
+ * The parts of a merge request that a given instance or plan may not have
+ * (approvals are Premium, `diffs` is recent). Each runs as its own request,
+ * so a schema error there degrades one section instead of the whole view.
+ */
+const MERGE_REQUEST_SECTION_QUERIES = {
+  discussions: itemQuery(
+    "mr",
+    `discussions(first: 100) {
+       nodes {
+         resolvable resolved
+         notes { nodes { ${NOTE_FIELDS} position { newPath oldPath newLine oldLine } } }
+       }
+     }`,
+  ),
+  diffs: itemQuery(
+    "mr",
+    `diffs(first: ${DIFF_PAGE}) {
+       pageInfo { hasNextPage }
+       nodes { oldPath newPath newFile deletedFile renamedFile diff }
+     }`,
+  ),
+  approvals: itemQuery(
+    "mr",
+    "approvalsRequired approvalsLeft approvedBy { nodes { username } }",
+  ),
+  jobs: itemQuery(
+    "mr",
+    "headPipeline { jobs(first: 100) { nodes { name status webPath } } }",
+  ),
+} as const;
+
+const UPDATE_ISSUE_MUTATION = `
+  mutation GitlabUpdateIssue($input: UpdateIssueInput!) {
+    updateIssue(input: $input) {
+      errors
+      issue { state labels { nodes { title } } }
+    }
+  }`;
+
+const SET_ASSIGNEES_MUTATION = `
+  mutation GitlabSetAssignees($input: IssueSetAssigneesInput!) {
+    issueSetAssignees(input: $input) {
+      errors
+      issue { assignees { nodes { username } } }
+    }
+  }`;
+
+const CREATE_NOTE_MUTATION = `
+  mutation GitlabCreateNote($input: CreateNoteInput!) {
+    createNote(input: $input) { errors }
+  }`;
+
+const CREATE_ISSUE_MUTATION = `
+  mutation GitlabCreateIssue($input: CreateIssueInput!) {
+    createIssue(input: $input) {
+      errors
+      issue { iid webUrl }
+    }
+  }`;
+
+/**
+ * Shell commands an agent runs to read an issue or merge request through
+ * GraphQL: the item with its comments, plus the diff for a merge request.
+ * Project refs and iids match strict patterns, so they need no escaping.
+ */
+export function graphqlReadCommands(
+  kind: "issue" | "mr",
+  project: string,
+  iid: number,
+): string[] {
+  const { host, path } = parseProjectRef(project);
+  const command = (selection: string): string => {
+    const field = kind === "mr" ? "mergeRequest" : "issue";
+    const query =
+      "query($path: ID!, $iid: String!) { project(fullPath: $path) { " +
+      `${field}(iid: $iid) { ${selection} } } }`;
+    return `glab api graphql --hostname ${host} -f path=${path} -f iid=${iid} -f query='${query}'`;
+  };
+  const comments =
+    "notes(first: 100) { nodes { system body createdAt author { username } } }";
+  if (kind === "issue") {
+    return [command(`title state webUrl description ${comments}`)];
+  }
+  return [
+    command(
+      `title state webUrl description sourceBranch targetBranch ${comments}`,
+    ),
+    command(`diffs(first: ${DIFF_PAGE}) { nodes { oldPath newPath diff } }`),
+  ];
+}
+
+/** The `data` of a GraphQL response, or an error carrying its messages. */
+export function graphqlData(raw: unknown): unknown {
+  const parsed = graphqlResponseSchema.safeParse(raw);
+  if (!parsed.success) throw new Error("malformed GitLab GraphQL response");
+  const { data, errors } = parsed.data;
+  if (errors !== undefined && errors.length > 0) {
+    throw new Error(
+      `GitLab GraphQL error: ${errors.map((error) => error.message).join("; ")}`,
+    );
+  }
+  return data ?? null;
+}
+
+/**
+ * The payload of mutation `field`. GitLab reports refused mutations (bad
+ * input, missing permission) in the payload's `errors`, not as GraphQL errors.
+ */
+export function mutationPayload(data: unknown, field: string): unknown {
+  const payload =
+    typeof data === "object" && data !== null
+      ? (data as Record<string, unknown>)[field]
+      : undefined;
+  if (payload == null) throw new Error(`GitLab ${field} returned no result`);
+  const errors = gitlabMutationErrorsSchema.parse(payload)?.errors ?? [];
+  if (errors.length > 0) {
+    throw new Error(`GitLab ${field} failed: ${errors.join("; ")}`);
+  }
+  return payload;
+}
 
 function needsConfiguration(message: string): Error {
   return Object.assign(new Error(message), {
@@ -633,89 +970,99 @@ export function validateGitlabCliArgs(argv: string[]): string | null {
   return null;
 }
 
-function usernames(rows: readonly GitlabUserRow[]): string[] {
-  return rows.map((row) => row.username).filter((name) => name.length > 0);
+function usernames(
+  connection: { nodes: Array<GitlabUserNode | null> } | null | undefined,
+): string[] {
+  return nodesOf(connection)
+    .map((node) => node.username)
+    .filter((name) => name.length > 0);
+}
+
+function labelTitles(
+  connection: { nodes: Array<{ title: string } | null> } | null | undefined,
+): string[] {
+  return nodesOf(connection)
+    .map((node) => node.title)
+    .filter((title) => title.length > 0);
+}
+
+/** Human notes of a note list — GitLab's activity feed is in there too. */
+function toNotes(notes: readonly GitlabNoteNode[]): Note[] {
+  return notes
+    .filter((note) => !note.system && note.body.trim().length > 0)
+    .map((note) => ({
+      author: note.author?.username ?? "",
+      body: note.body,
+      createdAt: note.createdAt,
+    }));
 }
 
 function toItem(
-  row: GitlabItemRow,
+  node: GitlabItemNode,
   project: string,
   kind: "issue" | "mr",
 ): CachedItem {
   return {
     project,
-    iid: row.iid,
+    iid: node.iid,
     kind,
-    title: row.title,
-    state: row.state,
-    draft: row.draft || row.work_in_progress,
-    author: row.author?.username ?? "",
-    labels: row.labels,
-    assignees: usernames(row.assignees),
-    url: row.web_url,
-    body: row.description,
-    updatedAt: row.updated_at,
+    title: node.title,
+    state: node.state,
+    draft: node.draft,
+    author: node.author?.username ?? "",
+    labels: labelTitles(node.labels),
+    assignees: usernames(node.assignees),
+    url: node.webUrl,
+    body: node.description,
+    updatedAt: node.updatedAt,
   };
 }
 
-/** Parses a GitLab issue/MR list payload, dropping rows it cannot read. */
+const gitlabItemConnectionSchema = connectionOf(gitlabItemNodeSchema);
+
+/** Parses an issue/MR connection, dropping nodes it cannot read. */
 export function toItems(
-  raw: unknown,
+  connection: unknown,
   project: string,
   kind: "issue" | "mr",
 ): CachedItem[] {
-  const rows = gitlabItemListSchema.parse(raw);
-  const items: CachedItem[] = [];
-  for (const row of rows) {
-    if (row !== null) items.push(toItem(row, project, kind));
-  }
-  return items;
+  return nodesOf(gitlabItemConnectionSchema.parse(connection)).map((node) =>
+    toItem(node, project, kind),
+  );
 }
+
+const gitlabSyncResultSchema = projectResultOf(
+  z.looseObject({
+    openIssues: z.unknown(),
+    closedIssues: z.unknown(),
+    openMergeRequests: z.unknown(),
+    closedMergeRequests: z.unknown(),
+    mergedMergeRequests: z.unknown(),
+  }),
+);
 
 /**
  * Open items plus a page of recently-closed (and merged) ones, so the Closed
- * filter has something to show without a live glab call per view. A project
- * with issues disabled still contributes its merge requests.
+ * filter has something to show without a live glab call per view. One
+ * GraphQL request covers all five lists. A project with issues disabled
+ * returns no issue connection and still contributes its merge requests; a
+ * project GitLab cannot find contributes nothing.
  */
 export async function fetchProjectItems(
-  api: GitlabApi,
+  api: GitlabGraphql,
   project: string,
 ): Promise<CachedItem[]> {
-  const { path } = parseProjectRef(project);
-  const base = `projects/${encodeURIComponent(path)}`;
-  const order = "order_by=updated_at&sort=desc";
-  const tolerant = async (endpoint: string): Promise<unknown> => {
-    try {
-      return await api(project, endpoint);
-    } catch (error) {
-      // Issues (or merge requests) disabled for the project — the 403/404
-      // here must not abort the rest of the sync.
-      if (/40[34]/.test(String(error))) return [];
-      throw error;
-    }
-  };
-  const [openIssues, closedIssues, openMrs, closedMrs, mergedMrs] =
-    await Promise.all([
-      tolerant(`${base}/issues?state=opened&per_page=${ISSUE_PAGE}&${order}`),
-      tolerant(
-        `${base}/issues?state=closed&per_page=${CLOSED_ISSUE_PAGE}&${order}`,
-      ),
-      tolerant(
-        `${base}/merge_requests?state=opened&per_page=${MR_PAGE}&${order}`,
-      ),
-      tolerant(
-        `${base}/merge_requests?state=closed&per_page=${CLOSED_MR_PAGE}&${order}`,
-      ),
-      tolerant(
-        `${base}/merge_requests?state=merged&per_page=${CLOSED_MR_PAGE}&${order}`,
-      ),
-    ]);
+  const { host, path } = parseProjectRef(project);
+  const result = gitlabSyncResultSchema.parse(
+    await api(host, SYNC_QUERY, { path }),
+  ).project;
+  if (result == null) return [];
   return [
-    ...toItems(openIssues, project, "issue"),
-    ...toItems(closedIssues, project, "issue"),
-    ...toItems(openMrs, project, "mr"),
-    ...toItems(closedMrs, project, "mr"),
-    ...toItems(mergedMrs, project, "mr"),
+    ...toItems(result.openIssues, project, "issue"),
+    ...toItems(result.closedIssues, project, "issue"),
+    ...toItems(result.openMergeRequests, project, "mr"),
+    ...toItems(result.closedMergeRequests, project, "mr"),
+    ...toItems(result.mergedMergeRequests, project, "mr"),
   ];
 }
 
@@ -723,12 +1070,13 @@ function run(
   file: string,
   args: string[],
   timeoutMs = 30_000,
+  stdin?: string,
 ): Promise<{ stdout: string; stderr: string }> {
   const { promise, resolve, reject } = Promise.withResolvers<{
     stdout: string;
     stderr: string;
   }>();
-  execFile(
+  const child = execFile(
     file,
     args,
     { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
@@ -746,6 +1094,7 @@ function run(
       }
     },
   );
+  if (stdin !== undefined) child.stdin?.end(stdin);
   return promise;
 }
 
@@ -801,26 +1150,28 @@ export default async function plugin(bb: BbPluginApi) {
     throw needsConfiguration(`GitLab CLI not found. ${GLAB_HINT}`);
   }
 
-  async function glab(args: string[], timeoutMs?: number): Promise<string> {
+  async function glab(
+    args: string[],
+    timeoutMs?: number,
+    stdin?: string,
+  ): Promise<string> {
     const file = await resolveGlab();
-    const { stdout } = await run(file, args, timeoutMs);
+    const { stdout } = await run(file, args, timeoutMs, stdin);
     return stdout;
   }
 
   /**
-   * Text parameters ride in the JSON body (--raw-field), which keeps commas
-   * and quotes intact; array parameters such as `assignee_ids[]` belong in the
-   * endpoint's query string, which GitLab also reads for PUT.
+   * The request body goes to glab as JSON on stdin (`--input -`), so query
+   * text and variables reach GitLab exactly as written: no field-type
+   * guessing, no placeholder expansion, and no argv length limit.
    */
-  const gitlabApi: GitlabApi = async (project, endpoint, options) => {
-    const { host } = parseProjectRef(project);
-    const args = ["api", "--hostname", host];
-    if (options?.method !== undefined) args.push("--method", options.method);
-    for (const [key, value] of Object.entries(options?.fields ?? {})) {
-      args.push("--raw-field", `${key}=${value}`);
-    }
-    args.push(endpoint);
-    return JSON.parse(await glab(args, 30_000)) as unknown;
+  const gitlabGraphql: GitlabGraphql = async (host, query, variables = {}) => {
+    const stdout = await glab(
+      ["api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
+      30_000,
+      JSON.stringify({ query, variables }),
+    );
+    return graphqlData(JSON.parse(stdout) as unknown);
   };
 
   /**
@@ -1096,7 +1447,7 @@ export default async function plugin(bb: BbPluginApi) {
     let total = 0;
     for (const { project } of projects) {
       try {
-        const items = await fetchProjectItems(gitlabApi, project);
+        const items = await fetchProjectItems(gitlabGraphql, project);
         replaceProjectRows(project, items);
         total += items.length;
       } catch (error) {
@@ -1210,7 +1561,9 @@ export default async function plugin(bb: BbPluginApi) {
             `Work on GitLab issue ${ref}: ${title}`,
             "",
             "Read the full issue and its comments first:",
-            `  glab issue view ${iid} -R ${project} --comments`,
+            ...graphqlReadCommands("issue", project, iid).map(
+              (command) => `  ${command}`,
+            ),
             "",
             item !== null && item.body.length > 0
               ? `Issue description:\n\n${item.body}`
@@ -1223,8 +1576,9 @@ export default async function plugin(bb: BbPluginApi) {
             `Review GitLab merge request ${ref}: ${title}`,
             "",
             "Read the merge request and its diff:",
-            `  glab mr view ${iid} -R ${project} --comments`,
-            `  glab mr diff ${iid} -R ${project}`,
+            ...graphqlReadCommands("mr", project, iid).map(
+              (command) => `  ${command}`,
+            ),
             "",
             "Review the change for correctness, missing tests, and design issues. " +
               "Summarize your findings with file/line references. Do not push " +
@@ -1249,14 +1603,49 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ------------------------------------------------------------------
   // Viewer identity + per-project members and labels, cached in memory so the
-  // filter chips and assignee picker don't hit the network on every render.
+  // filter chips and pickers don't hit the network on every render.
   // ------------------------------------------------------------------
   const viewerCache = new Map<string, { username: string; fetchedAt: number }>();
   const membersCache = new Map<
     string,
-    { members: GitlabUserRow[]; fetchedAt: number }
+    { members: string[]; fetchedAt: number }
   >();
-  const labelsCache = new Map<string, { labels: string[]; fetchedAt: number }>();
+  const labelsCache = new Map<
+    string,
+    { labels: Array<{ id: string; title: string }>; fetchedAt: number }
+  >();
+
+  const viewerResultSchema = z
+    .looseObject({ currentUser: gitlabUserNodeSchema.nullish().catch(null) })
+    .catch({ currentUser: null });
+  const membersResultSchema = projectResultOf(
+    z.looseObject({
+      projectMembers: connectionOf(
+        z.looseObject({ user: gitlabUserNodeSchema.nullish().catch(null) }),
+      ),
+    }),
+  );
+  const labelsResultSchema = projectResultOf(
+    z.looseObject({
+      labels: z
+        .looseObject({
+          pageInfo: z
+            .looseObject({
+              hasNextPage: z.boolean().catch(false),
+              endCursor: z.string().nullable().catch(null),
+            })
+            .catch({ hasNextPage: false, endCursor: null }),
+          nodes: z.array(gitlabLabelNodeSchema.nullable().catch(null)).catch([]),
+        })
+        .nullish()
+        .catch(null),
+    }),
+  );
+  type LabelsConnection = NonNullable<
+    z.infer<typeof labelsResultSchema>["project"]
+  >["labels"];
+  /** Label pages to walk before giving up on a project's label list. */
+  const MAX_LABEL_PAGES = 10;
 
   async function getViewer(host?: string): Promise<string> {
     const resolvedHost = host ?? authenticatedHosts[0]?.host;
@@ -1267,8 +1656,10 @@ export default async function plugin(bb: BbPluginApi) {
     if (cached !== undefined && Date.now() - cached.fetchedAt < 60 * 60_000) {
       return cached.username;
     }
-    const raw = await glab(["api", "--hostname", resolvedHost, "user"], 15_000);
-    const { username } = gitlabUserRowSchema.parse(JSON.parse(raw));
+    const { currentUser } = viewerResultSchema.parse(
+      await gitlabGraphql(resolvedHost, VIEWER_QUERY),
+    );
+    const username = currentUser?.username ?? "";
     if (username.length === 0) {
       throw new Error(`could not resolve the glab user on ${resolvedHost}`);
     }
@@ -1276,83 +1667,121 @@ export default async function plugin(bb: BbPluginApi) {
     return username;
   }
 
-  async function getMembers(project: string): Promise<GitlabUserRow[]> {
+  /** Usernames of the project's direct and inherited members. */
+  async function getMembers(project: string): Promise<string[]> {
     const cached = membersCache.get(project);
     if (cached !== undefined && Date.now() - cached.fetchedAt < 10 * 60_000) {
       return cached.members;
     }
-    const { path } = parseProjectRef(project);
-    const members = gitlabMemberListSchema.parse(
-      await gitlabApi(
-        project,
-        `projects/${encodeURIComponent(path)}/members/all?per_page=100`,
-      ),
-    );
+    const { host, path } = parseProjectRef(project);
+    const result = membersResultSchema.parse(
+      await gitlabGraphql(host, MEMBERS_QUERY, { path }),
+    ).project;
+    const members = nodesOf(result?.projectMembers)
+      .map((member) => member.user?.username ?? "")
+      .filter((name) => name.length > 0);
     membersCache.set(project, { members, fetchedAt: Date.now() });
     return members;
   }
 
-  /** GitLab assigns by numeric user id, so usernames need resolving first. */
-  async function resolveUserIds(
+  /**
+   * Project and ancestor-group labels with their global ids, which is what
+   * GraphQL mutations take. Group labels can repeat a project label's title;
+   * the first one GitLab returns wins.
+   */
+  async function getProjectLabels(
     project: string,
-    names: readonly string[],
-  ): Promise<number[]> {
-    if (names.length === 0) return [];
-    const idByName = new Map<string, number>();
-    for (const member of await getMembers(project)) {
-      if (member.username.length > 0 && member.id > 0) {
-        idByName.set(member.username, member.id);
-      }
-    }
-    const ids: number[] = [];
-    for (const name of names) {
-      const known = idByName.get(name);
-      if (known !== undefined) {
-        ids.push(known);
-        continue;
-      }
-      // Assignable without being a direct member (group or instance user).
-      const [found] = gitlabMemberListSchema.parse(
-        await gitlabApi(project, `users?username=${encodeURIComponent(name)}`),
-      );
-      if (found === undefined || found.id <= 0) {
-        throw new Error(`unknown GitLab user "${name}"`);
-      }
-      ids.push(found.id);
-    }
-    return ids;
-  }
-
-  async function getProjectLabels(project: string): Promise<string[]> {
+    force = false,
+  ): Promise<Array<{ id: string; title: string }>> {
     const cached = labelsCache.get(project);
-    if (cached !== undefined && Date.now() - cached.fetchedAt < 10 * 60_000) {
+    if (
+      !force &&
+      cached !== undefined &&
+      Date.now() - cached.fetchedAt < 10 * 60_000
+    ) {
       return cached.labels;
     }
-    const { path } = parseProjectRef(project);
-    const rows = gitlabLabelListSchema.parse(
-      await gitlabApi(
-        project,
-        `projects/${encodeURIComponent(path)}/labels?per_page=100&with_counts=false`,
-      ),
+    const { host, path } = parseProjectRef(project);
+    const byTitle = new Map<string, { id: string; title: string }>();
+    let after: string | null = null;
+    for (let page = 0; page < MAX_LABEL_PAGES; page += 1) {
+      const connection: LabelsConnection = labelsResultSchema.parse(
+        await gitlabGraphql(host, LABELS_QUERY, { path, after }),
+      ).project?.labels;
+      for (const label of nodesOf(connection)) {
+        const title = label.title.trim();
+        if (title.length > 0 && label.id.length > 0 && !byTitle.has(title)) {
+          byTitle.set(title, { id: label.id, title });
+        }
+      }
+      if (connection?.pageInfo.hasNextPage !== true) break;
+      after = connection.pageInfo.endCursor;
+      if (after === null) break;
+    }
+    const labels = [...byTitle.values()].sort((a, b) =>
+      a.title.localeCompare(b.title),
     );
-    // Group labels come back alongside project labels and can repeat.
-    const labels = [
-      ...new Set(rows.map((row) => row.name.trim()).filter(Boolean)),
-    ].sort((a, b) => a.localeCompare(b));
     labelsCache.set(project, { labels, fetchedAt: Date.now() });
     return labels;
   }
 
-  /** Human notes of a GitLab note list — GitLab's activity feed is in there too. */
-  function toNotes(raw: unknown): Note[] {
-    return gitlabNoteListSchema
-      .parse(raw)
-      .filter((row) => !row.system && row.body.trim().length > 0)
-      .map((row) => ({
-        author: row.author?.username ?? "",
-        body: row.body,
-        createdAt: row.created_at,
-      }));
+  /** Label titles → global ids, refreshing once for a label created lately. */
+  async function resolveLabelIds(
+    project: string,
+    titles: readonly string[],
+  ): Promise<string[]> {
+    if (titles.length === 0) return [];
+    let labels = await getProjectLabels(project);
+    if (titles.some((title) => !labels.some((label) => label.title === title))) {
+      labels = await getProjectLabels(project, true);
+    }
+    return titles.map((title) => {
+      const found = labels.find((label) => label.title === title);
+      if (found === undefined) throw new Error(`unknown GitLab label "${title}"`);
+      return found.id;
+    });
+  }
+
+  const itemIdResultSchema = projectResultOf(
+    z.looseObject({
+      item: z.looseObject({ id: z.string().min(1) }).nullish().catch(null),
+    }),
+  );
+
+  /** The global id of an issue or merge request, which createNote takes. */
+  async function getNoteableId(
+    kind: "issue" | "mr",
+    project: string,
+    iid: number,
+  ): Promise<string> {
+    const { host, path } = parseProjectRef(project);
+    const item = itemIdResultSchema.parse(
+      await gitlabGraphql(host, itemQuery(kind, "id"), {
+        path,
+        iid: String(iid),
+      }),
+    ).project?.item;
+    if (item == null) {
+      const marker = kind === "mr" ? "!" : "#";
+      throw new Error(`GitLab ${project}${marker}${iid} not found`);
+    }
+    return item.id;
+  }
+
+  async function addNote(
+    kind: "issue" | "mr",
+    project: string,
+    iid: number,
+    body: string,
+  ): Promise<void> {
+    const noteableId = await getNoteableId(kind, project, iid);
+    const { host } = parseProjectRef(project);
+    mutationPayload(
+      await gitlabGraphql(host, CREATE_NOTE_MUTATION, {
+        input: { noteableId, body },
+      }),
+      "createNote",
+    );
   }
 
   // ------------------------------------------------------------------
@@ -1400,28 +1829,34 @@ export default async function plugin(bb: BbPluginApi) {
     async assignableUsers(input) {
       const members = await getMembers(input.project);
       return {
-        users: [...new Set(usernames(members))].sort((a, b) =>
-          a.localeCompare(b),
-        ),
+        users: [...new Set(members)].sort((a, b) => a.localeCompare(b)),
       };
     },
 
     /** { project } → labels available in that project. */
     async projectLabels(input) {
-      return { labels: await getProjectLabels(input.project) };
+      const labels = await getProjectLabels(input.project);
+      return { labels: labels.map((label) => label.title) };
     },
 
     /** { project, iid, state } → close or reopen an issue. */
     async setIssueState({ project, iid, state }): Promise<{ ok: true }> {
-      const { path } = parseProjectRef(project);
-      const event = state === "closed" ? "close" : "reopen";
-      await gitlabApi(
-        project,
-        `projects/${encodeURIComponent(path)}/issues/${iid}?state_event=${event}`,
-        { method: "PUT" },
+      const { host, path } = parseProjectRef(project);
+      const payload = updatedIssueSchema.parse(
+        mutationPayload(
+          await gitlabGraphql(host, UPDATE_ISSUE_MUTATION, {
+            input: {
+              projectPath: path,
+              iid: String(iid),
+              stateEvent: state === "closed" ? "CLOSE" : "REOPEN",
+            },
+          }),
+          "updateIssue",
+        ),
       );
       patchCachedItem("issue", project, iid, {
-        state: state === "closed" ? "closed" : "opened",
+        state:
+          payload.issue?.state ?? (state === "closed" ? "closed" : "opened"),
       });
       return { ok: true };
     },
@@ -1432,21 +1867,22 @@ export default async function plugin(bb: BbPluginApi) {
       iid,
       assignees,
     }): Promise<{ ok: true; assignees: string[] }> {
-      const next = [...new Set(assignees)];
-      const { path } = parseProjectRef(project);
-      const ids = await resolveUserIds(project, next);
-      // GitLab clears the assignee list when the id list is exactly [0].
-      const query = (ids.length > 0 ? ids : [0])
-        .map((id) => `assignee_ids[]=${id}`)
-        .join("&");
-      const updated = gitlabItemRowSchema.parse(
-        await gitlabApi(
-          project,
-          `projects/${encodeURIComponent(path)}/issues/${iid}?${query}`,
-          { method: "PUT" },
+      const { host, path } = parseProjectRef(project);
+      const payload = updatedIssueSchema.parse(
+        mutationPayload(
+          await gitlabGraphql(host, SET_ASSIGNEES_MUTATION, {
+            input: {
+              projectPath: path,
+              iid: String(iid),
+              // REPLACE with an empty list clears the assignees.
+              assigneeUsernames: [...new Set(assignees)],
+              operationMode: "REPLACE",
+            },
+          }),
+          "issueSetAssignees",
         ),
       );
-      const applied = usernames(updated.assignees);
+      const applied = usernames(payload.issue?.assignees);
       patchCachedItem("issue", project, iid, { assignees: applied });
       return { ok: true, assignees: applied };
     },
@@ -1458,32 +1894,33 @@ export default async function plugin(bb: BbPluginApi) {
       labels,
     }): Promise<{ ok: true; labels: string[] }> {
       const next = [
-        ...new Set(labels.map((label) => label.trim()).filter(Boolean)),
+        ...new Set<string>(labels.map((label) => label.trim()).filter(Boolean)),
       ];
-      const { path } = parseProjectRef(project);
-      const updated = gitlabItemRowSchema.parse(
-        await gitlabApi(
-          project,
-          `projects/${encodeURIComponent(path)}/issues/${iid}`,
-          { method: "PUT", fields: { labels: next.join(",") } },
+      const { host, path } = parseProjectRef(project);
+      const labelIds = await resolveLabelIds(project, next);
+      const payload = updatedIssueSchema.parse(
+        mutationPayload(
+          await gitlabGraphql(host, UPDATE_ISSUE_MUTATION, {
+            input: { projectPath: path, iid: String(iid), labelIds },
+          }),
+          "updateIssue",
         ),
       );
-      patchCachedItem("issue", project, iid, { labels: updated.labels });
-      return { ok: true, labels: updated.labels };
+      const applied = labelTitles(payload.issue?.labels);
+      patchCachedItem("issue", project, iid, { labels: applied });
+      return { ok: true, labels: applied };
     },
 
     /** { project, iid } → live issue detail incl. comments. */
     async getIssue({ project, iid }) {
-      const { path } = parseProjectRef(project);
-      const base = `projects/${encodeURIComponent(path)}/issues/${iid}`;
-      const [detailRaw, notesRaw] = await Promise.all([
-        gitlabApi(project, base),
-        gitlabApi(
-          project,
-          `${base}/notes?per_page=100&sort=asc&order_by=created_at`,
-        ),
-      ]);
-      const detail = gitlabItemRowSchema.parse(detailRaw);
+      const { host, path } = parseProjectRef(project);
+      const detail = issueDetailResultSchema.parse(
+        await gitlabGraphql(host, ISSUE_DETAIL_QUERY, {
+          path,
+          iid: String(iid),
+        }),
+      ).project?.item;
+      if (detail == null) throw new Error(`GitLab ${project}#${iid} not found`);
       return {
         issue: {
           project,
@@ -1492,11 +1929,11 @@ export default async function plugin(bb: BbPluginApi) {
           state: detail.state,
           author: detail.author?.username ?? "",
           body: detail.description,
-          labels: detail.labels,
+          labels: labelTitles(detail.labels),
           assignees: usernames(detail.assignees),
-          url: detail.web_url,
-          updatedAt: detail.updated_at,
-          notes: toNotes(notesRaw),
+          url: detail.webUrl,
+          updatedAt: detail.updatedAt,
+          notes: toNotes(nodesOf(detail.notes)),
         },
       };
     },
@@ -1509,49 +1946,51 @@ export default async function plugin(bb: BbPluginApi) {
      * degrades that section instead of the whole view.
      */
     async getMergeRequest({ project, iid }) {
-      const { path } = parseProjectRef(project);
-      const encoded = encodeURIComponent(path);
-      const base = `projects/${encoded}/merge_requests/${iid}`;
-      const optional = async (endpoint: string): Promise<unknown> => {
+      const { host, path } = parseProjectRef(project);
+      const variables = { path, iid: String(iid) };
+      const optional = async (
+        section: keyof typeof MERGE_REQUEST_SECTION_QUERIES,
+      ): Promise<unknown> => {
         try {
-          return await gitlabApi(project, endpoint);
+          return itemOf(
+            await gitlabGraphql(
+              host,
+              MERGE_REQUEST_SECTION_QUERIES[section],
+              variables,
+            ),
+          );
         } catch (error) {
           bb.log.warn(
-            `optional call ${endpoint} failed: ${
+            `optional merge request ${section} for ${project}!${iid} failed: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
           return undefined;
         }
       };
-      const [detailRaw, notesRaw, discussionsRaw, diffsRaw, approvalsRaw] =
+      const [detailRaw, discussionsRaw, diffsRaw, approvalsRaw, jobsRaw] =
         await Promise.all([
-          gitlabApi(project, base),
-          gitlabApi(
-            project,
-            `${base}/notes?per_page=100&sort=asc&order_by=created_at`,
-          ),
-          optional(`${base}/discussions?per_page=100`),
-          optional(`${base}/diffs?per_page=${DIFF_PAGE}`),
-          optional(`${base}/approvals`),
+          gitlabGraphql(host, MERGE_REQUEST_DETAIL_QUERY, variables),
+          optional("discussions"),
+          optional("diffs"),
+          optional("approvals"),
+          optional("jobs"),
         ]);
-      const detail = gitlabMergeRequestRowSchema.parse(detailRaw);
+      const detail = mergeRequestDetailResultSchema.parse(detailRaw).project
+        ?.item;
+      if (detail == null) throw new Error(`GitLab ${project}!${iid} not found`);
 
-      const pipelineId = detail.head_pipeline?.id ?? null;
-      const jobs = gitlabJobListSchema
-        .parse(
-          pipelineId === null
-            ? []
-            : await optional(
-                `projects/${encoded}/pipelines/${pipelineId}/jobs?per_page=100`,
-              ),
-        )
-        .map((job) => ({
+      const jobs = nodesOf(
+        mergeRequestJobsSchema.parse(jobsRaw).headPipeline?.jobs,
+      ).map((job) => {
+        const rawStatus = job.status.toLowerCase();
+        return {
           name: job.name,
-          status: classifyJobStatus(job.status),
-          rawStatus: job.status,
-          url: job.web_url,
-        }));
+          status: classifyJobStatus(rawStatus),
+          rawStatus,
+          url: webUrlFor(job.webPath, detail.webUrl),
+        };
+      });
 
       // A discussion whose notes carry a diff position is an inline review
       // thread; everything else already showed up in the conversation notes.
@@ -1561,61 +2000,63 @@ export default async function plugin(bb: BbPluginApi) {
         resolved: boolean;
         notes: Note[];
       }> = [];
-      for (const discussion of gitlabDiscussionListSchema.parse(
-        discussionsRaw,
+      for (const discussion of nodesOf(
+        mergeRequestDiscussionsSchema.parse(discussionsRaw).discussions,
       )) {
-        const position = discussion.notes.find(
+        const discussionNotes = nodesOf(discussion.notes);
+        const position = discussionNotes.find(
           (note) => note.position != null,
         )?.position;
         if (position == null) continue;
-        const notes = discussion.notes
-          .filter((note) => !note.system && note.body.trim().length > 0)
-          .map((note) => ({
-            author: note.author?.username ?? "",
-            body: note.body,
-            createdAt: note.created_at,
-          }));
+        const notes = toNotes(discussionNotes);
         if (notes.length === 0) continue;
         discussions.push({
-          path: position.new_path ?? position.old_path ?? "",
-          line: position.new_line ?? position.old_line,
-          resolved: discussion.notes.every(
-            (note) => !note.resolvable || note.resolved,
-          ),
+          path: position.newPath ?? position.oldPath ?? "",
+          line: position.newLine ?? position.oldLine,
+          resolved: !discussion.resolvable || discussion.resolved,
           notes,
         });
       }
 
-      let additions = 0;
-      let deletions = 0;
-      const files = gitlabDiffListSchema.parse(diffsRaw).map((file) => {
-        const counts = countDiffLines(file.diff);
-        additions += counts.additions;
-        deletions += counts.deletions;
-        return {
-          path: file.new_path || file.old_path,
-          status: file.new_file
-            ? "added"
-            : file.deleted_file
-              ? "deleted"
-              : file.renamed_file
-                ? "renamed"
-                : "modified",
-          additions: counts.additions,
-          deletions: counts.deletions,
-          // Very large diffs stay on GitLab — the panel links out instead.
-          patch:
-            file.diff.length > 0 && file.diff.length <= MAX_PATCH_BYTES
-              ? file.diff
-              : null,
-        };
-      });
-
+      // Per-file counts come from diffStats; the diff text, when this
+      // instance serves it, from diffs. Without diffs the file list still
+      // shows, with every patch left on GitLab.
+      const statsByPath = new Map(
+        detail.diffStats.map((stat) => [stat.path, stat]),
+      );
+      const diffs = mergeRequestDiffsSchema.parse(diffsRaw).diffs;
+      const files =
+        diffs != null
+          ? diffs.nodes.map((file) => {
+              const path = file.newPath ?? file.oldPath ?? "";
+              const counts = statsByPath.get(path) ?? countDiffLines(file.diff);
+              return {
+                path,
+                status: file.newFile
+                  ? "added"
+                  : file.deletedFile
+                    ? "deleted"
+                    : file.renamedFile
+                      ? "renamed"
+                      : "modified",
+                additions: counts.additions,
+                deletions: counts.deletions,
+                // Very large diffs stay on GitLab — the panel links out instead.
+                patch:
+                  file.diff.length > 0 && file.diff.length <= MAX_PATCH_BYTES
+                    ? file.diff
+                    : null,
+              };
+            })
+          : detail.diffStats.map((stat) => ({
+              path: stat.path,
+              status: "modified",
+              additions: stat.additions,
+              deletions: stat.deletions,
+              patch: null,
+            }));
+      const summary = detail.diffStatsSummary;
       const approvals = gitlabApprovalsSchema.parse(approvalsRaw);
-      const changesCount = Number.parseInt(String(detail.changes_count), 10);
-      const changedFiles = Number.isFinite(changesCount)
-        ? changesCount
-        : files.length;
 
       return {
         mergeRequest: {
@@ -1623,40 +2064,40 @@ export default async function plugin(bb: BbPluginApi) {
           iid,
           title: detail.title,
           state: detail.state,
-          draft: detail.draft || detail.work_in_progress,
+          draft: detail.draft,
           author: detail.author?.username ?? "",
           body: detail.description,
-          url: detail.web_url,
-          createdAt: detail.created_at,
-          updatedAt: detail.updated_at,
-          sourceBranch: detail.source_branch,
-          targetBranch: detail.target_branch,
-          additions,
-          deletions,
-          changedFiles,
-          // The page cutoff is the only thing that truncates the diff list;
-          // changes_count can disagree for its own reasons ("1000+", files
-          // GitLab returns without diff text) and must not fake truncation.
-          filesTruncated: files.length >= DIFF_PAGE,
-          labels: detail.labels,
+          url: detail.webUrl,
+          createdAt: detail.createdAt,
+          updatedAt: detail.updatedAt,
+          sourceBranch: detail.sourceBranch,
+          targetBranch: detail.targetBranch,
+          additions:
+            summary?.additions ??
+            files.reduce((sum, file) => sum + file.additions, 0),
+          deletions:
+            summary?.deletions ??
+            files.reduce((sum, file) => sum + file.deletions, 0),
+          changedFiles: summary?.fileCount ?? files.length,
+          filesTruncated: diffs?.pageInfo.hasNextPage ?? false,
+          labels: labelTitles(detail.labels),
           assignees: usernames(detail.assignees),
           reviewers: usernames(detail.reviewers),
-          mergeStatus: detail.detailed_merge_status || detail.merge_status,
-          hasConflicts: detail.has_conflicts,
-          approvalsRequired: approvals.approvals_required,
-          approvalsLeft: approvals.approvals_left,
-          approvedBy: approvals.approved_by
-            .map((entry) => entry.user?.username ?? "")
-            .filter((name) => name.length > 0),
+          // GraphQL enums are upper case; the panel expects snake case.
+          mergeStatus: (detail.detailedMergeStatus ?? "").toLowerCase(),
+          hasConflicts: detail.conflicts,
+          approvalsRequired: approvals.approvalsRequired,
+          approvalsLeft: approvals.approvalsLeft,
+          approvedBy: usernames(approvals.approvedBy),
           pipeline:
-            detail.head_pipeline == null
+            detail.headPipeline == null
               ? null
               : {
-                  status: detail.head_pipeline.status,
-                  url: detail.head_pipeline.web_url,
+                  status: detail.headPipeline.status.toLowerCase(),
+                  url: webUrlFor(detail.headPipeline.path, detail.webUrl),
                 },
           jobs,
-          notes: toNotes(notesRaw),
+          notes: toNotes(nodesOf(detail.notes)),
           discussions,
           files,
         },
@@ -1665,49 +2106,41 @@ export default async function plugin(bb: BbPluginApi) {
 
     /** { project, iid, body } → add an issue comment. */
     async commentIssue({ project, iid, body }): Promise<{ ok: true }> {
-      const { path } = parseProjectRef(project);
-      await gitlabApi(
-        project,
-        `projects/${encodeURIComponent(path)}/issues/${iid}/notes`,
-        { method: "POST", fields: { body } },
-      );
+      await addNote("issue", project, iid, body);
       return { ok: true };
     },
 
     /** { project, iid, body } → add a merge-request comment. */
     async commentMergeRequest({ project, iid, body }): Promise<{ ok: true }> {
-      const { path } = parseProjectRef(project);
-      await gitlabApi(
-        project,
-        `projects/${encodeURIComponent(path)}/merge_requests/${iid}/notes`,
-        { method: "POST", fields: { body } },
-      );
+      await addNote("mr", project, iid, body);
       return { ok: true };
     },
 
     /** { project, title, body? } → create an issue, refresh, return iid+url. */
     async createIssue(input) {
-      const { path } = parseProjectRef(input.project);
-      const created = gitlabItemRowSchema.parse(
-        await gitlabApi(
-          input.project,
-          `projects/${encodeURIComponent(path)}/issues`,
-          {
-            method: "POST",
-            fields: { title: input.title, description: input.body ?? "" },
-          },
+      const { host, path } = parseProjectRef(input.project);
+      const { issue } = createdIssueSchema.parse(
+        mutationPayload(
+          await gitlabGraphql(host, CREATE_ISSUE_MUTATION, {
+            input: {
+              projectPath: path,
+              title: input.title,
+              description: input.body ?? "",
+            },
+          }),
+          "createIssue",
         ),
       );
       try {
         replaceProjectRows(
           input.project,
-          await fetchProjectItems(gitlabApi, input.project),
+          await fetchProjectItems(gitlabGraphql, input.project),
         );
         bb.realtime.publish("data-changed", {});
       } catch {
         // creation succeeded; the next scheduled sync will pick it up
       }
-      return { iid: created.iid, url: created.web_url };
+      return { iid: issue?.iid ?? null, url: issue?.webUrl ?? "" };
     },
 
     /** { project, iid } → spawn a worker thread on an issue. */
@@ -1797,27 +2230,30 @@ export default async function plugin(bb: BbPluginApi) {
     if (!isProjectRef(project) || !Number.isInteger(iid) || iid <= 0) {
       throw new Error(`malformed mention id "${itemId}"`);
     }
-    const { path } = parseProjectRef(project);
+    const { host, path } = parseProjectRef(project);
     const noun = kind === "mr" ? "merge request" : "issue";
-    const collection = kind === "mr" ? "merge_requests" : "issues";
-    const command = kind === "mr" ? "mr" : "issue";
     try {
-      const detail = gitlabItemRowSchema.parse(
-        await gitlabApi(
-          project,
-          `projects/${encodeURIComponent(path)}/${collection}/${iid}`,
+      const detail = itemDetailResultSchema.parse(
+        await gitlabGraphql(
+          host,
+          kind === "mr" ? MERGE_REQUEST_QUERY : ISSUE_QUERY,
+          { path, iid: String(iid) },
         ),
-      );
+      ).project?.item;
+      if (detail == null) {
+        throw new Error(`GitLab ${project}${marker}${iid} not found`);
+      }
       return {
         context: [
           `# GitLab ${noun} ${project}${marker}${iid}: ${detail.title}`,
           "",
           `State: ${detail.state} · Author: ${detail.author?.username ?? ""}`,
-          `URL: ${detail.web_url}`,
+          `URL: ${detail.webUrl}`,
           "",
           detail.description.length > 0 ? detail.description : "(no description)",
           "",
-          `For full comments/diff run: glab ${command} view ${iid} -R ${project} --comments`,
+          "For full comments/diff run:",
+          ...graphqlReadCommands(kind, project, iid),
         ].join("\n"),
       };
     } catch (error) {
