@@ -83,6 +83,28 @@ function run(
   return promise;
 }
 
+/**
+ * The request body goes to glab as JSON on stdin (`--input -`), so query
+ * text and variables reach GitLab exactly as written: no field-type
+ * guessing, no placeholder expansion, and no argv length limit. glab before
+ * 1.123 sends `--input` bodies with no Content-Type, and GitLab then ignores
+ * the body ("Unexpected end of document"), so the header is set explicitly.
+ */
+export function graphqlArgs(host: string): string[] {
+  return [
+    "api",
+    "graphql",
+    "--hostname",
+    host,
+    "--method",
+    "POST",
+    "--header",
+    "Content-Type: application/json",
+    "--input",
+    "-",
+  ];
+}
+
 export function createGlab(): Glab {
   // The server process may have a trimmed PATH, so probe common install
   // locations once and remember the winner.
@@ -117,14 +139,9 @@ export function createGlab(): Glab {
     return stdout;
   }
 
-  /**
-   * The request body goes to glab as JSON on stdin (`--input -`), so query
-   * text and variables reach GitLab exactly as written: no field-type
-   * guessing, no placeholder expansion, and no argv length limit.
-   */
   const graphql: GitlabGraphql = async (host, query, variables = {}) => {
     const stdout = await glab(
-      ["api", "graphql", "--hostname", host, "--method", "POST", "--input", "-"],
+      graphqlArgs(host),
       30_000,
       JSON.stringify({ query, variables }),
     );

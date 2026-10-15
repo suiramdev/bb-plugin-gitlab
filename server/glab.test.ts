@@ -1,5 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { parseAuthenticatedHosts } from "./glab";
+import { graphqlArgs, parseAuthenticatedHosts } from "./glab";
+
+describe("glab api graphql", () => {
+  it("labels the stdin body as JSON so GitLab parses it", () => {
+    const args = graphqlArgs("gitlab.example.dev");
+    expect(args.slice(0, 4)).toEqual([
+      "api",
+      "graphql",
+      "--hostname",
+      "gitlab.example.dev",
+    ]);
+    const header = args.indexOf("--header");
+    expect(args[header + 1]).toBe("Content-Type: application/json");
+    expect(args.slice(-2)).toEqual(["--input", "-"]);
+  });
+});
 
 describe("glab auth status", () => {
   it("collects only the hosts glab reports as logged in", () => {
