@@ -1,7 +1,7 @@
 // The GitLab CLI: finding the binary, running it, reading which hosts it is
 // logged in to and how each is reached, and sending GraphQL through
 // `glab api graphql`. Every GitLab request the plugin makes goes through here.
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { graphqlData } from "./graphql/payloads";
 import { normalizeHostname, type GitlabHost } from "./project-ref";
 
@@ -51,6 +51,39 @@ export function parseAuthenticatedHosts(output: string): string[] {
   return [...hosts];
 }
 
+/**
+ * Whether a child process never ran to completion: killed by its timeout or
+ * maxBuffer, signalled, or failed to spawn for want of resources. Such a run
+ * says nothing about glab's install or auth state and is worth retrying.
+ */
+export function isUnfinishedRun(error: ExecFileException): boolean {
+  return (
+    error.killed === true ||
+    (error.signal !== undefined && error.signal !== null) ||
+    (typeof error.code === "string" &&
+      error.code !== "ENOENT" &&
+      error.code !== "EACCES")
+  );
+}
+
+/**
+ * Hosts from one `glab auth status` run. glab exits non-zero when any
+ * configured host fails, so a run that exited is judged by its text, not its
+ * exit code; one that never exited (timed out, signalled, failed to spawn)
+ * throws a plain, retryable error rather than passing for "no host is
+ * logged in".
+ */
+export function readAuthStatus(
+  error: ExecFileException | null,
+  stdout: string,
+  stderr: string,
+): string[] {
+  if (error !== null && typeof error.code !== "number") {
+    throw new Error(`glab auth status did not finish: ${error.message}`);
+  }
+  return parseAuthenticatedHosts(`${stdout}\n${stderr}`);
+}
+
 function run(
   file: string,
   args: string[],
@@ -72,6 +105,7 @@ function run(
             `${file} ${args.slice(0, 3).join(" ")} failed: ${
               stderr.trim() || error.message
             }`,
+            { cause: error },
           ),
         );
       } else {
@@ -117,15 +151,20 @@ export function createGlab(): Glab {
       "/opt/homebrew/bin/glab",
       "/usr/local/bin/glab",
     ];
+    let unfinished: unknown = null;
     for (const candidate of candidates) {
       try {
         await run(candidate, ["--version"], 5_000);
         glabPath = candidate;
         return candidate;
-      } catch {
-        // try the next location
+      } catch (error) {
+        // A probe that timed out under load may well be glab; only a candidate
+        // that is missing or broken counts against it.
+        const cause = error instanceof Error ? error.cause : undefined;
+        if (cause instanceof Error && isUnfinishedRun(cause)) unfinished = error;
       }
     }
+    if (unfinished !== null) throw unfinished;
     throw needsConfiguration(`GitLab CLI not found. ${GLAB_HINT}`);
   }
 
@@ -176,16 +215,22 @@ export function createGlab(): Glab {
 
   async function authenticatedHosts(): Promise<GitlabHost[]> {
     const file = await resolveGlab();
-    // `glab auth status` writes its report to stderr and exits non-zero when
-    // any configured host fails, so read the text rather than the exit code.
-    const { promise, resolve } = Promise.withResolvers<string>();
+    const { promise, resolve } = Promise.withResolvers<{
+      error: ExecFileException | null;
+      stdout: string;
+      stderr: string;
+    }>();
     execFile(
       file,
       ["auth", "status"],
       { timeout: 15_000, maxBuffer: 1024 * 1024 },
-      (_error, stdout, stderr) => resolve(`${stdout}\n${stderr}`),
+      (error, stdout, stderr) => resolve({ error, stdout, stderr }),
     );
-    const hosts = parseAuthenticatedHosts(await promise);
+    const result = await promise;
+    // A binary that vanished since it was resolved: look again next time.
+    if (result.error?.code === "ENOENT") glabPath = null;
+    // Throws on an unfinished run, so the caller keeps the last known hosts.
+    const hosts = readAuthStatus(result.error, result.stdout, result.stderr);
     if (hosts.length === 0) {
       throw needsConfiguration(
         `GitLab CLI is not authenticated with any host. ${GLAB_HINT}`,

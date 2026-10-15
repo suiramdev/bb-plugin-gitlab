@@ -32,6 +32,12 @@ import {
 export { gitlabRpcContract };
 
 const SYNC_INTERVAL_MS = 5 * 60_000;
+/** Retry delay after a sync that failed for a transient reason. */
+const SYNC_RETRY_MS = 60_000;
+
+function isNeedsConfiguration(error: unknown): boolean {
+  return error instanceof Error && error.name === "NeedsConfigurationError";
+}
 
 interface ProjectInfo {
   /** "host/group/sub/project" */
@@ -87,7 +93,10 @@ export default async function plugin(bb: BbPluginApi) {
       authenticatedHosts = await glab.authenticatedHosts();
       glabAuthError = null;
     } catch (error) {
-      glabAuthError = error instanceof Error ? error.message : String(error);
+      // A check that did not finish keeps the last known hosts and status.
+      if (isNeedsConfiguration(error)) {
+        glabAuthError = error instanceof Error ? error.message : String(error);
+      }
       throw error;
     }
   }
@@ -209,17 +218,30 @@ export default async function plugin(bb: BbPluginApi) {
 
   // Initial sync + 5-minute refresh loop. NeedsConfigurationError from a
   // missing/unauthenticated glab flips the plugin to needs-configuration
-  // instead of crash-looping. The abort check after each sync is load-bearing:
+  // instead of crash-looping; any other failure — a glab call timing out
+  // under load — is logged and retried sooner, so one slow tick never ends
+  // the service. The abort check after each sync is load-bearing:
   // an abort that lands mid-sync would otherwise register its listener on an
   // already-aborted signal, which never fires, and the reload would wait out
   // the full interval and report the plugin degraded.
   bb.background.service("sync", {
     async start(signal) {
       while (!signal.aborted) {
-        await syncAll();
+        let delay = SYNC_INTERVAL_MS;
+        try {
+          await syncAll();
+        } catch (error) {
+          if (isNeedsConfiguration(error)) throw error;
+          bb.log.warn(
+            `sync failed, retrying in ${SYNC_RETRY_MS / 1000}s: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          delay = SYNC_RETRY_MS;
+        }
         if (signal.aborted) break;
         const sleep = Promise.withResolvers<void>();
-        const timer = setTimeout(sleep.resolve, SYNC_INTERVAL_MS);
+        const timer = setTimeout(sleep.resolve, delay);
         signal.addEventListener(
           "abort",
           () => {
@@ -234,13 +256,17 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   // Surface an unconfigured glab immediately instead of waiting for the
-  // service's first crash.
+  // service's first crash. A check that merely did not finish is left to the
+  // sync loop's retry.
   try {
     await checkAuth();
   } catch (error) {
-    bb.status.needsConfiguration(
-      error instanceof Error ? error.message : String(error),
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    if (isNeedsConfiguration(error)) {
+      bb.status.needsConfiguration(message);
+    } else {
+      bb.log.warn(`initial glab auth check failed: ${message}`);
+    }
   }
 
   // ------------------------------------------------------------------
