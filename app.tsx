@@ -33,7 +33,7 @@ import {
   useRealtime,
   useRpc,
   type PluginNavPanelProps,
-  type PluginThreadPanelProps,
+  type ExperimentalThreadActionTabProps,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { gitlabRpcContract } from "./server/contract";
@@ -198,6 +198,8 @@ interface Status {
   glabOk: boolean;
   glabError: string | null;
   hosts: string[];
+  machines: Array<{ id: string; name: string; status: string; hosts: string[] }>;
+  selectedMachine: string | null;
   projects: ProjectInfo[];
   lastSyncedAt: string | null;
 }
@@ -405,6 +407,11 @@ let viewerUsername: string | null = null;
 function useViewer(): string | null {
   const rpc = useRpc<typeof gitlabRpcContract>();
   const [username, setUsername] = useState<string | null>(viewerUsername);
+  useRealtime("machine-changed", () => {
+    viewerUsername = null;
+    setUsername(null);
+    rpc.call("viewer").then(result => { viewerUsername = result.username; setUsername(result.username); }, () => {});
+  });
   useEffect(() => {
     if (viewerUsername !== null) return;
     rpc.call("viewer").then(
@@ -2211,7 +2218,7 @@ function MergeRequestPickerList({
   );
 }
 
-function MergeRequestPanelTab({ threadId }: PluginThreadPanelProps) {
+function MergeRequestPanelTab({ threadId }: ExperimentalThreadActionTabProps) {
   const rpc = useRpc<typeof gitlabRpcContract>();
   const [resolved, setResolved] = useState(false);
   const [selected, setSelected] = useState<{
@@ -2358,6 +2365,19 @@ function PanelHeader() {
   }, [rpc]);
   return (
     <>
+      <label className="text-xs text-muted-foreground">
+        Machine{" "}
+        <select aria-label="GitLab machine" className="rounded border bg-background px-2 py-1"
+          value={status?.selectedMachine ?? ""}
+          onChange={event => rpc.call("selectMachine", { hostId: event.target.value || null }).catch(error => toast.error(errorText(error)))}>
+          <option value="">Automatic</option>
+          {status?.machines.map(machine => (
+            <option key={machine.id} value={machine.id}>
+              {machine.name}{machine.status !== "connected" ? " (offline)" : machine.hosts.length === 0 ? " (not authenticated)" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
       <span className="hidden text-xs text-muted-foreground sm:inline">
         {failed
           ? "Sync failed — check `glab auth status`"
@@ -2642,10 +2662,13 @@ export default definePluginApp((app) => {
     component: GitlabPanel,
     headerContent: PanelHeader,
   });
-  app.slots.threadPanelAction({
+  app.slots.experimental_tab({
+    context: { kind: "thread" },
+    availability: "action",
     id: "merge-request",
     title: "Merge request",
     icon: "GitMerge",
     component: MergeRequestPanelTab,
+    run: ({ openPanel }) => { openPanel({ title: "Merge request" }); },
   });
 });

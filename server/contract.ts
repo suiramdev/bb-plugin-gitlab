@@ -132,12 +132,15 @@ export const gitlabRpcContract = defineRpcContract({
         glabOk: z.boolean(),
         glabError: z.string().nullable(),
         hosts: z.array(z.string()),
+        machines: z.array(z.object({ id: z.string(), name: z.string(), status: z.string(), hosts: z.array(z.string()) })),
+        selectedMachine: z.string().nullable(),
         projects: z.array(projectInfoSchema),
         lastSyncedAt: z.string().nullable(),
       })
       .strict(),
   },
   refresh: { input: z.null(), output: syncResultSchema },
+  selectMachine: { input: z.object({ hostId: z.string().nullable() }).strict(), output: okResultSchema },
   listItems: {
     input: z
       .object({

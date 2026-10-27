@@ -13,12 +13,14 @@
 // A project is addressed by its host-qualified ref — "gitlab.com/group/sub/app"
 // — because a GitLab path has any number of namespace segments and the same
 // path can exist on two instances.
-import type { BbPluginApi } from "@get-bb/plugin-sdk";
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { BbPluginApi, PluginRpcHandlers } from "@get-bb/plugin-sdk";
 import { mentionContextText, spawnPrompt } from "./server/agent-prompts";
 import { GITLAB_CLI_COMMANDS, runGitlabCli } from "./server/cli";
 import { gitlabRpcContract } from "./server/contract";
 import { createGitlabApi } from "./server/gitlab-api";
-import { createGlab } from "./server/glab";
+import { needsConfiguration, type GitlabGraphql } from "./server/glab";
+import { hostContract } from "./server/host-contract";
 import { createItemCache } from "./server/item-cache";
 import { fetchProjectItems } from "./server/items";
 import {
@@ -84,28 +86,52 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------------
   // glab: the binary, its logged-in hosts, and the GitLab API behind it.
   // ------------------------------------------------------------------
-  const glab = createGlab();
+  const worker = bb.hosts.experimental_client({ contract: hostContract });
+  let selectedMachine = (await bb.storage.kv.get<string>("selected-machine")) ?? null;
+  const requestMachine = new AsyncLocalStorage<string | null>();
+  let machines: Array<{ id: string; name: string; status: string; hosts: GitlabHost[] }> = [];
   let glabAuthError: string | null = "checking glab…";
   let authenticatedHosts: GitlabHost[] = [];
 
   async function checkAuth(): Promise<void> {
-    try {
-      authenticatedHosts = await glab.authenticatedHosts();
-      glabAuthError = null;
-    } catch (error) {
-      // A check that did not finish keeps the last known hosts and status.
-      if (isNeedsConfiguration(error)) {
-        glabAuthError = error instanceof Error ? error.message : String(error);
+    const hosts = await bb.sdk.hosts.list();
+    machines = await Promise.all(hosts.map(async machine => {
+      let authenticated: GitlabHost[] = [];
+      if (machine.status === "connected") {
+        try { authenticated = (await worker.call("probe", null, { hostId: machine.id, timeoutMs: 22000 })).hosts; }
+        catch (error) { bb.log.debug(`GitLab unavailable on ${machine.name}: ${String(error)}`); }
       }
-      throw error;
-    }
+      return { id: machine.id, name: machine.name, status: machine.status, hosts: authenticated };
+    }));
+    authenticatedHosts = [...new Map(machines.flatMap(machine => machine.hosts).map(host => [host.host, host])).values()];
+    projectCache = null;
+    glabAuthError = authenticatedHosts.length ? null : "No connected machine is authenticated with GitLab.";
+    bb.realtime.publish("data-changed", {});
   }
 
-  const gitlab = createGitlabApi({
-    graphql: glab.graphql,
-    defaultHost: () => authenticatedHosts[0]?.host,
+  function resolveMachine(host: string, write: boolean): string {
+    const choice = requestMachine.getStore() === undefined ? selectedMachine : requestMachine.getStore();
+    const eligible = machines.filter(machine => machine.status === "connected" && machine.hosts.some(h => h.host === host));
+    if (choice === null && write && eligible.length > 1) throw new Error("Select a machine before changing GitLab data.");
+    const machine = choice === null ? eligible[0] : eligible.find(item => item.id === choice);
+    if (!machine) throw needsConfiguration(`Selected machine is unavailable or not authenticated for ${host}.`);
+    return machine.id;
+  }
+  function graphqlOn(machineId: string): GitlabGraphql {
+    return async (host, query, variables = {}) => {
+      const jsonVariables = JSON.parse(JSON.stringify(variables));
+      const response = await worker.call("graphql", { host, query, variables: jsonVariables }, { hostId: machineId, timeoutMs: 35000 });
+      return JSON.parse(response.json) as unknown;
+    };
+  }
+  const graphql: GitlabGraphql = async (host, query, variables) =>
+    graphqlOn(resolveMachine(host, /^\s*mutation\b/.test(query)))(host, query, variables);
+  const makeGitlab = () => createGitlabApi({
+    graphql,
+    defaultHost: () => machines.find(machine => machine.id === selectedMachine)?.hosts[0]?.host ?? authenticatedHosts[0]?.host,
     warn: (message) => bb.log.warn(message),
   });
+  let gitlab = makeGitlab();
 
   // ------------------------------------------------------------------
   // Project discovery: BB project git remotes → host/path. The remote comes
@@ -178,9 +204,24 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function syncProject(project: string): Promise<number> {
-    const items = await fetchProjectItems(glab.graphql, project);
-    cache.replaceProject(project, items);
-    return items.length;
+    const host = parseProjectRef(project).host;
+    const candidates = machines.filter(machine => machine.status === "connected" && machine.hosts.some(entry => entry.host === host));
+    const results = await Promise.allSettled(candidates.map(machine => fetchProjectItems(graphqlOn(machine.id), project)));
+    if (!results.some(result => result.status === "fulfilled")) return 0;
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") cache.replaceMachine(candidates[index].id, project, result.value);
+    });
+    const merged = new Map<string, ReturnType<typeof cache.list>[number]>();
+    if (results.some(result => result.status === "rejected") || machines.some(machine => machine.status !== "connected" || machine.hosts.length === 0)) {
+      for (const item of cache.list({ project })) merged.set(`${item.kind}:${item.iid}`, item);
+    }
+    for (const item of cache.mergedProject(project)) {
+      const key = `${item.kind}:${item.iid}`;
+      const previous = merged.get(key);
+      if (!previous || item.updatedAt >= previous.updatedAt) merged.set(key, item);
+    }
+    cache.replaceProject(project, [...merged.values()]);
+    return merged.size;
   }
 
   async function syncAll(
@@ -191,7 +232,7 @@ export default async function plugin(bb: BbPluginApi) {
     const before = cache.fingerprint();
     // A project that stopped being tracked — removed from extraProjects, or
     // gone from GitLab — must not keep serving rows to lists and mentions.
-    cache.retainProjects(projects.map((entry) => entry.project));
+    // Inaccessible hosts must not erase previously cached projects.
     let total = 0;
     for (const { project } of projects) {
       try {
@@ -258,16 +299,6 @@ export default async function plugin(bb: BbPluginApi) {
   // Surface an unconfigured glab immediately instead of waiting for the
   // service's first crash. A check that merely did not finish is left to the
   // sync loop's retry.
-  try {
-    await checkAuth();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (isNeedsConfiguration(error)) {
-      bb.status.needsConfiguration(message);
-    } else {
-      bb.log.warn(`initial glab auth check failed: ${message}`);
-    }
-  }
 
   // ------------------------------------------------------------------
   // Issue/MR ↔ thread links (the pills in the UI).
@@ -338,7 +369,7 @@ export default async function plugin(bb: BbPluginApi) {
   // ------------------------------------------------------------------
   // rpc — the frontend data plane.
   // ------------------------------------------------------------------
-  bb.rpc.register(gitlabRpcContract, {
+  const handlers: PluginRpcHandlers<typeof gitlabRpcContract> = {
     /** () → auth/sync status for the panel banner. */
     async status() {
       const cursor = await bb.storage.kv.get<{
@@ -350,9 +381,21 @@ export default async function plugin(bb: BbPluginApi) {
         glabOk: glabAuthError === null,
         glabError: glabAuthError,
         hosts: authenticatedHosts.map((entry) => entry.host),
+        machines: machines.map(machine => ({ ...machine, hosts: machine.hosts.map(host => host.host) })),
+        selectedMachine,
         projects: await discoverProjects(),
         lastSyncedAt: cursor?.lastSyncedAt ?? null,
       };
+    },
+
+    async selectMachine({ hostId }) {
+      if (hostId !== null && !machines.some(machine => machine.id === hostId)) throw new Error("Unknown machine");
+      selectedMachine = hostId;
+      await bb.storage.kv.set("selected-machine", hostId);
+      gitlab = makeGitlab();
+      bb.realtime.publish("machine-changed", {});
+      bb.realtime.publish("data-changed", {});
+      return { ok: true as const };
     },
 
     /** () → force a full sync now. */
@@ -475,11 +518,10 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
         if (thread.environmentId !== null) {
-          const result = await bb.sdk.environments.pullRequest({
-            environmentId: thread.environmentId,
-          });
+          const legacy = bb.sdk.environments as unknown as { pullRequest?: (args: { environmentId: string }) => Promise<{ outcome: string; pullRequest: { url: string } }> };
+          const result = await legacy.pullRequest?.({ environmentId: thread.environmentId });
           const match =
-            result.outcome === "available"
+            result?.outcome === "available"
               ? result.pullRequest.url.match(
                   /^https?:\/\/([^/]+)\/(.+?)\/-\/merge_requests\/(\d+)/,
                 )
@@ -513,7 +555,12 @@ export default async function plugin(bb: BbPluginApi) {
     async listLinks() {
       return { links: await listAllLinks() };
     },
-  });
+  };
+  const boundHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [
+    name,
+    (...args: unknown[]) => requestMachine.run(selectedMachine, () => (handler as (...args: unknown[]) => unknown)(...args)),
+  ])) as PluginRpcHandlers<typeof gitlabRpcContract>;
+  bb.rpc.register(gitlabRpcContract, boundHandlers);
 
   // ------------------------------------------------------------------
   // Mentions: issues (# as on GitLab) and merge requests (! as on GitLab)

@@ -97,7 +97,7 @@ function run(
   const child = execFile(
     file,
     args,
-    { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+    { timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
     (error, stdout, stderr) => {
       if (error) {
         reject(
@@ -223,7 +223,7 @@ export function createGlab(): Glab {
     execFile(
       file,
       ["auth", "status"],
-      { timeout: 15_000, maxBuffer: 1024 * 1024 },
+      { timeout: 15_000, killSignal: "SIGKILL", maxBuffer: 1024 * 1024 },
       (error, stdout, stderr) => resolve({ error, stdout, stderr }),
     );
     const result = await promise;

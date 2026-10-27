@@ -53,14 +53,20 @@ thread links survive it.
 
 ## Auth and any GitLab domain
 
-Uses the GitLab CLI, so the plugin reaches whatever instances `glab` reaches —
+Uses the GitLab CLI on connected BB machines, so the plugin reaches the instances their `glab` installations reach —
 `gitlab.com`, a self-managed instance on any domain, or several at once. Every
 host that appears as `Logged in to <host> as <user>` in `glab auth status` is
-usable; if no host is authenticated the plugin reports needs-configuration. No
-tokens are stored by the plugin.
+usable. Credentials remain on the machine running glab. The list combines
+results across machines by GitLab host, project, kind, and IID, retaining the
+last successful results while a machine is unavailable.
+
+The Machine selector controls live reads and changes. When more than one
+machine can reach a host, choose a machine before changing data. A selected
+offline or unauthenticated machine fails explicitly; writes never fall back to
+another account. Agent threads use their BB project's default environment.
 
 ```sh
-glab auth login --hostname gitlab.example.dev
+glab auth login --hostname gitlab.example.dev # on each relevant machine
 bb plugin reload gitlab
 ```
 

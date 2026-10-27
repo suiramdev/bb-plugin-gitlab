@@ -18,6 +18,8 @@ export interface ItemCache {
   get(kind: "issue" | "mr", project: string, iid: number): CachedItem | null;
   /** Replaces every row of one project with a fresh sync. */
   replaceProject(project: string, items: CachedItem[]): void;
+  replaceMachine(machine: string, project: string, items: CachedItem[]): void;
+  mergedProject(project: string): CachedItem[];
   /** Drops rows of projects no longer tracked. */
   retainProjects(projects: readonly string[]): void;
   /** Patches a row in place after a mutation, ahead of the next sync. */
@@ -48,6 +50,11 @@ export function createItemCache(storage: BbPluginApi["storage"]): ItemCache {
        body TEXT NOT NULL,
        updated_at TEXT NOT NULL,
        PRIMARY KEY (project, kind, iid)
+     )`,
+    `CREATE TABLE IF NOT EXISTS machine_items (
+       machine TEXT NOT NULL, project TEXT NOT NULL, kind TEXT NOT NULL,
+       iid INTEGER NOT NULL, data TEXT NOT NULL,
+       PRIMARY KEY (machine, project, kind, iid)
      )`,
   ]);
 
@@ -141,6 +148,26 @@ export function createItemCache(storage: BbPluginApi["storage"]): ItemCache {
     })();
   }
 
+  function replaceMachine(machine: string, project: string, items: CachedItem[]): void {
+    const insert = db.prepare("INSERT OR REPLACE INTO machine_items(machine, project, kind, iid, data) VALUES (?, ?, ?, ?, ?)");
+    db.transaction(() => {
+      db.prepare("DELETE FROM machine_items WHERE machine = ? AND project = ?").run(machine, project);
+      for (const item of items) insert.run(machine, project, item.kind, item.iid, JSON.stringify(item));
+    })();
+  }
+
+  function mergedProject(project: string): CachedItem[] {
+    const merged = new Map<string, CachedItem>();
+    const rows = db.prepare("SELECT data FROM machine_items WHERE project = ?").all(project) as Array<{ data: string }>;
+    for (const row of rows) {
+      const item = JSON.parse(row.data) as CachedItem;
+      const key = `${item.kind}:${item.iid}`;
+      const previous = merged.get(key);
+      if (!previous || item.updatedAt >= previous.updatedAt) merged.set(key, item);
+    }
+    return [...merged.values()];
+  }
+
   function patch(
     kind: "issue" | "mr",
     project: string,
@@ -182,6 +209,8 @@ export function createItemCache(storage: BbPluginApi["storage"]): ItemCache {
     list,
     get,
     replaceProject,
+    replaceMachine,
+    mergedProject,
     retainProjects,
     patch,
     fingerprint: () => JSON.stringify(fingerprintQuery.all()),
